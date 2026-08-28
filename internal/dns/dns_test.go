@@ -191,3 +191,17 @@ func TestEngine_PolicyBlock(t *testing.T) {
 		t.Errorf("Expected NXDOMAIN (3), got %d", resp[3]&0x0F)
 	}
 }
+
+func BenchmarkDNSCache_Get(b *testing.B) {
+	cache := NewCache(10 * time.Minute)
+	dstIP := net.ParseIP("1.1.1.2")
+	dummyResp := createTestQuery(0x1111, "github.com", TypeA)
+	dummyResp[2] = 0x81
+	cache.Set(dstIP, "github.com", TypeA, dummyResp)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = cache.Get(dstIP, "github.com", TypeA, uint16(i))
+	}
+}

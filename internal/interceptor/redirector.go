@@ -31,6 +31,15 @@ func MakeSessionKeyIPv4(ip [4]byte, port uint16) SessionKey {
 	return k
 }
 
+// MakeSessionKeyIPv6 creates a zero-alloc SessionKey from raw 16-byte IPv6.
+func MakeSessionKeyIPv6(ip [16]byte, port uint16) SessionKey {
+	var k SessionKey
+	copy(k.IP[:], ip[:])
+	k.Port = port
+	k.IsV6 = true
+	return k
+}
+
 // MakeSessionKeyFromNetIP creates a SessionKey from a standard net.IP.
 func MakeSessionKeyFromNetIP(ip net.IP, port uint16) SessionKey {
 	var k SessionKey
@@ -67,6 +76,17 @@ type dryRunSessionInfo struct {
 	LastSeen atomic.Int64
 }
 
+type dnsTask struct {
+	clientAddr net.Addr
+	targetIP   net.IP
+	srcPort    uint16
+	dstPort    uint16
+	isIPv6     bool
+	payload    []byte
+	rawPacket  []byte
+	origAddr   WinDivertAddress
+}
+
 // FilterEvaluator checks if a host or IP should be blocked.
 type FilterEvaluator interface {
 	ShouldBlock(hostOrIP string) bool
@@ -96,6 +116,8 @@ type Redirector struct {
 	filterEng      FilterEvaluator
 	routingEng     RoutingEvaluator
 	dnsEng         DNSEvaluator
+	coarseNano     atomic.Int64
+	dnsQueue       chan dnsTask
 	mu             sync.Mutex
 	closed         bool
 }
@@ -136,14 +158,17 @@ func NewRedirector(localListenAddr string, customFilter string) (*Redirector, er
 		filterStr = fmt.Sprintf("((outbound and tcp and !loopback) or (outbound and tcp and tcp.SrcPort == %d) or (outbound and udp and udp.DstPort == 443 and !loopback))", port)
 	}
 
-	return &Redirector{
+	r := &Redirector{
 		dll:            dll,
 		handle:         syscall.InvalidHandle,
 		filterStr:      filterStr,
 		localProxyPort: port,
 		localProxyIP:   ip,
 		pid:            pid,
-	}, nil
+		dnsQueue:       make(chan dnsTask, 2048),
+	}
+	r.coarseNano.Store(time.Now().UnixNano())
+	return r, nil
 }
 
 // SetDryRun configures dry-run audit mode without intercepting traffic.
@@ -198,6 +223,27 @@ func (r *Redirector) Start(ctx context.Context) error {
 
 	log.Printf("[Redirector] WinDivert started with filter: %s", r.filterStr)
 
+	// Start coarse timestamp background ticker (20ms interval) to avoid per-packet time.Now syscalls
+	r.coarseNano.Store(time.Now().UnixNano())
+	go func() {
+		ticker := time.NewTicker(20 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case t := <-ticker.C:
+				r.coarseNano.Store(t.UnixNano())
+			}
+		}
+	}()
+
+	// Start DNS worker pool to handle intercepted DNS queries concurrently without unbounded goroutines
+	const numDNSWorkers = 16
+	for w := 0; w < numDNSWorkers; w++ {
+		go r.dnsWorker(ctx)
+	}
+
 	// Start multi-worker packet processing loops for high throughput
 	numWorkers := runtime.NumCPU()
 	if numWorkers < 2 {
@@ -213,6 +259,59 @@ func (r *Redirector) Start(ctx context.Context) error {
 	go r.sessionGCLoop(ctx)
 
 	return nil
+}
+
+// dnsWorker consumes DNS tasks from the bounded queue.
+func (r *Redirector) dnsWorker(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case task, ok := <-r.dnsQueue:
+			if !ok {
+				return
+			}
+			r.processDNSTask(ctx, task)
+		}
+	}
+}
+
+// processDNSTask processes an intercepted DNS query packet asynchronously.
+func (r *Redirector) processDNSTask(ctx context.Context, task dnsTask) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			logger.Debugf("[DNS] Recovered from panic in DNS task processor: %v", rec)
+		}
+	}()
+
+	if r.dnsEng == nil {
+		return
+	}
+
+	respData, passthrough := r.dnsEng.ProcessDNSQuery(ctx, task.clientAddr, task.targetIP, task.payload)
+	if passthrough {
+		sendAddr := task.origAddr
+		_, _ = r.dll.Send(r.handle, task.rawPacket, &sendAddr)
+		return
+	}
+
+	if len(respData) > 0 {
+		var respPkt []byte
+		if task.isIPv6 {
+			respPkt = BuildIPv6UDPPacket(task.targetIP, task.clientAddr.(*net.UDPAddr).IP, task.dstPort, task.srcPort, respData)
+		} else {
+			respPkt = BuildIPv4UDPPacket(task.targetIP, task.clientAddr.(*net.UDPAddr).IP, task.dstPort, task.srcPort, respData)
+		}
+
+		if respPkt != nil {
+			injectAddr := task.origAddr
+			injectAddr.SetOutbound(false) // Inbound to client
+			injectAddr.Flags |= WINDIVERT_ADDRESS_FLAG_IMPOSTOR
+			injectAddr.Flags &^= WINDIVERT_ADDRESS_FLAG_LOOPBACK
+			_ = r.dll.CalcChecksums(respPkt, &injectAddr, 0)
+			_, _ = r.dll.Send(r.handle, respPkt, &injectAddr)
+		}
+	}
 }
 
 // LookupOriginalDestination retrieves the original destination IP and port for a client connection.
@@ -301,7 +400,7 @@ func (r *Redirector) packetLoop(ctx context.Context, workerID int) {
 								continue
 							}
 
-							nowNano := time.Now().UnixNano()
+							nowNano := r.coarseNano.Load()
 
 							// DIAGNOSTIC: Detect self-interception of proxy's own outbound connections
 							if srcPort >= 40000 && srcPort <= 48999 {
@@ -404,8 +503,6 @@ func (r *Redirector) packetLoop(ctx context.Context, workerID int) {
 								}
 
 								// Rewrite destination to local adapter IP and proxy listener port.
-								// When localProxyIP is not explicitly set (listening on 0.0.0.0), rewriting DstIP to srcIP (client's local IP)
-								// guarantees Windows TCP stack recognizes it as a local destination and delivers it to 0.0.0.0:18080.
 								targetIP := r.localProxyIP
 								if targetIP == nil {
 									targetIP = net.IPv4(srcIP[0], srcIP[1], srcIP[2], srcIP[3])
@@ -420,18 +517,12 @@ func (r *Redirector) packetLoop(ctx context.Context, workerID int) {
 						srcPort, dstPort, _, dataOffset, err := ParseUDPFast(rawPacket, ihl)
 						if err == nil {
 							if dstPort == 443 {
-								// ----------------------------------------------------
-								// UDP 443 (HTTP/3 QUIC) Interception:
-								// Browsers attempt QUIC via UDP 443, bypassing TCP proxy.
-								// In normal mode, drop UDP 443 to force browsers to fallback to TCP/TLS (HTTP/2 / HTTP/1.1).
-								// ----------------------------------------------------
+								// UDP 443 (HTTP/3 QUIC) Interception: Drop to force TCP fallback
 								if !r.dryRun {
-									continue // Silently DROP UDP 443 packet (do not reinject)
+									continue
 								}
 							} else if dstPort == 53 && r.dnsEng != nil && !r.dryRun {
-								// ----------------------------------------------------
-								// UDP 53 DNS Interception & DoH Dynamic Upgrade
-								// ----------------------------------------------------
+								// UDP 53 DNS Interception & Worker Pool Queue
 								payload := rawPacket[dataOffset:]
 								clientAddr := &net.UDPAddr{
 									IP:   net.IPv4(srcIP[0], srcIP[1], srcIP[2], srcIP[3]),
@@ -441,35 +532,24 @@ func (r *Redirector) packetLoop(ctx context.Context, workerID int) {
 
 								rawCopy := append([]byte(nil), rawPacket...)
 								payloadCopy := append([]byte(nil), payload...)
-								origAddr := addr
 
-								go func(cAddr net.Addr, tIP net.IP, sPort, dPort uint16, pld, rPkt []byte, oAddr WinDivertAddress) {
-									defer func() {
-										if rec := recover(); rec != nil {
-											logger.Debugf("[DNS] Recovered from panic in DNS handler: %v", rec)
-										}
-									}()
+								task := dnsTask{
+									clientAddr: clientAddr,
+									targetIP:   targetIP,
+									srcPort:    srcPort,
+									dstPort:    dstPort,
+									isIPv6:     false,
+									payload:    payloadCopy,
+									rawPacket:  rawCopy,
+									origAddr:   addr,
+								}
 
-									respData, passthrough := r.dnsEng.ProcessDNSQuery(ctx, cAddr, tIP, pld)
-									if passthrough {
-										// Passthrough: send original query packet as-is to remote DNS server
-										sendAddr := oAddr
-										_, _ = r.dll.Send(r.handle, rPkt, &sendAddr)
-										return
-									}
-									if len(respData) > 0 {
-										// Build response UDP packet: Src = targetIP:53, Dst = clientIP:srcPort
-										respPkt := BuildIPv4UDPPacket(tIP, cAddr.(*net.UDPAddr).IP, dPort, sPort, respData)
-										if respPkt != nil {
-											injectAddr := oAddr
-											injectAddr.SetOutbound(false) // Inbound to client
-											injectAddr.Flags |= WINDIVERT_ADDRESS_FLAG_IMPOSTOR
-											injectAddr.Flags &^= WINDIVERT_ADDRESS_FLAG_LOOPBACK
-											_ = r.dll.CalcChecksums(respPkt, &injectAddr, 0)
-											_, _ = r.dll.Send(r.handle, respPkt, &injectAddr)
-										}
-									}
-								}(clientAddr, targetIP, srcPort, dstPort, payloadCopy, rawCopy, origAddr)
+								select {
+								case r.dnsQueue <- task:
+								default:
+									// Spillage / fallback worker on queue saturation
+									go r.processDNSTask(ctx, task)
+								}
 
 								continue // Handled asynchronously
 							}
@@ -477,29 +557,29 @@ func (r *Redirector) packetLoop(ctx context.Context, workerID int) {
 					}
 				} else if addr.IsIPv6() {
 					// ----------------------------------------------------
-					// IPv6 Packet Processing (TCP NAT & QUIC Interception)
+					// IPv6 Packet Processing (Zero-Alloc Fast Path)
 					// ----------------------------------------------------
-					ip6Hdr, ihl, err := ParseIPv6Header(rawPacket)
-					if err == nil && ip6Hdr.NextHeader == IPPROTO_TCP {
+					nextHdr, srcIP6, dstIP6, _, ihl, err := ParseIPv6Fast(rawPacket)
+					if err == nil && nextHdr == IPPROTO_TCP {
 						srcPort, dstPort, tcpFlags, dataOffset, err := ParseTCPFast(rawPacket, ihl)
 						if err == nil {
 							if r.dryRun {
-								clientKey := MakeSessionKeyFromNetIP(ip6Hdr.SrcIP, srcPort)
+								clientKey := MakeSessionKeyIPv6(srcIP6, srcPort)
 								payloadOffset := ihl + dataOffset
 								var payload []byte
 								if len(rawPacket) > payloadOffset {
 									payload = rawPacket[payloadOffset:]
 								}
-								r.handleDryRunTCP(clientKey, ip6Hdr.DstIP, dstPort, payload)
+								r.handleDryRunTCP(clientKey, net.IP(dstIP6[:]), dstPort, payload)
 								continue
 							}
 
-							nowNano := time.Now().UnixNano()
+							nowNano := r.coarseNano.Load()
 
 							// DIAGNOSTIC: Detect self-interception of proxy's own outbound connections
 							if srcPort >= 40000 && srcPort <= 48999 {
 								logger.Debugf("[TRAP-v6] SELF-INTERCEPTION DETECTED! SrcPort=%d is in proxy outbound range! [%s]:%d -> [%s]:%d (pktLen=%d, IfIdx=%d, Flags=0x%x, Loopback=%v)",
-									srcPort, ip6Hdr.SrcIP, srcPort, ip6Hdr.DstIP, dstPort,
+									srcPort, net.IP(srcIP6[:]), srcPort, net.IP(dstIP6[:]), dstPort,
 									len(rawPacket), addr.IfIdx, addr.Flags, addr.IsLoopback())
 								// DO NOT process - just reinject as-is to prevent loop
 								_, _ = r.dll.Send(r.handle, rawPacket, &addr)
@@ -511,13 +591,13 @@ func (r *Redirector) packetLoop(ctx context.Context, workerID int) {
 								// REVERSE NAT (IPv6): Response packet from Local Proxy to Client
 								// Rewrite SrcIP:SrcPort back to OriginalDstIP:OriginalDstPort
 								// ----------------------------------------------------
-								clientKey := MakeSessionKeyFromNetIP(ip6Hdr.DstIP, dstPort)
+								clientKey := MakeSessionKeyIPv6(dstIP6, dstPort)
 								if val, exists := r.sessions.Load(clientKey); exists {
 									info := val.(*SessionInfo)
 									info.LastSeen.Store(nowNano)
 
 									logger.Debugf("[RNAT-v6] Reverse NAT: [%s]:%d -> [%s]:%d -> Rewrite Src to [%s]:%d",
-										ip6Hdr.SrcIP, srcPort, ip6Hdr.DstIP, dstPort,
+										net.IP(srcIP6[:]), srcPort, net.IP(dstIP6[:]), dstPort,
 										info.OriginalDstIP, info.OriginalDstPort)
 
 									_ = RewriteIPv6TCP(rawPacket, info.OriginalDstIP, nil, info.OriginalDstPort, 0)
@@ -536,23 +616,24 @@ func (r *Redirector) packetLoop(ctx context.Context, workerID int) {
 									}
 									continue
 								} else {
-									logger.Debugf("[RNAT-v6] No session found for clientKey=[%s]:%d", ip6Hdr.DstIP, dstPort)
+									logger.Debugf("[RNAT-v6] No session found for clientKey=[%s]:%d", net.IP(dstIP6[:]), dstPort)
 								}
 							} else {
 								// ----------------------------------------------------
 								// FORWARD NAT (IPv6): Request packet from Client to Remote Target
 								// Save Original Destination & rewrite Dst to Local Proxy
 								// ----------------------------------------------------
-								clientKey := MakeSessionKeyFromNetIP(ip6Hdr.SrcIP, srcPort)
+								clientKey := MakeSessionKeyIPv6(srcIP6, srcPort)
+								dstNetIP := append(net.IP(nil), dstIP6[:]...)
 
 								var info *SessionInfo
 								if val, exists := r.sessions.Load(clientKey); exists {
 									existing := val.(*SessionInfo)
 									if (tcpFlags&TCP_SYN != 0 && tcpFlags&TCP_ACK == 0) ||
-										!existing.OriginalDstIP.Equal(ip6Hdr.DstIP) ||
+										!existing.OriginalDstIP.Equal(dstNetIP) ||
 										existing.OriginalDstPort != dstPort {
 										info = &SessionInfo{
-											OriginalDstIP:   append(net.IP(nil), ip6Hdr.DstIP...),
+											OriginalDstIP:   dstNetIP,
 											OriginalDstPort: dstPort,
 											IfIdx:           addr.IfIdx,
 											SubIfIdx:        addr.SubIfIdx,
@@ -561,7 +642,7 @@ func (r *Redirector) packetLoop(ctx context.Context, workerID int) {
 										info.LastSeen.Store(nowNano)
 										r.sessions.Store(clientKey, info)
 										logger.Debugf("[NAT-v6]  New/Updated Session: [%s]:%d -> [%s]:%d | IfIdx=%d, Flags=0x%x",
-											ip6Hdr.SrcIP, srcPort, ip6Hdr.DstIP, dstPort, addr.IfIdx, addr.Flags)
+											net.IP(srcIP6[:]), srcPort, dstNetIP, dstPort, addr.IfIdx, addr.Flags)
 									} else {
 										info = existing
 										info.LastSeen.Store(nowNano)
@@ -573,7 +654,7 @@ func (r *Redirector) packetLoop(ctx context.Context, workerID int) {
 								} else {
 									now := time.Now()
 									info = &SessionInfo{
-										OriginalDstIP:   append(net.IP(nil), ip6Hdr.DstIP...),
+										OriginalDstIP:   dstNetIP,
 										OriginalDstPort: dstPort,
 										IfIdx:           addr.IfIdx,
 										SubIfIdx:        addr.SubIfIdx,
@@ -582,13 +663,13 @@ func (r *Redirector) packetLoop(ctx context.Context, workerID int) {
 									info.LastSeen.Store(nowNano)
 									r.sessions.Store(clientKey, info)
 									logger.Debugf("[NAT-v6]  Intercepted: [%s]:%d -> [%s]:%d | IfIdx=%d, Flags=0x%x",
-										ip6Hdr.SrcIP, srcPort, ip6Hdr.DstIP, dstPort, addr.IfIdx, addr.Flags)
+										net.IP(srcIP6[:]), srcPort, dstNetIP, dstPort, addr.IfIdx, addr.Flags)
 								}
 
 								// Rewrite destination to client's local IPv6 address and proxy listener port.
 								targetIP := r.localProxyIP
 								if targetIP == nil || targetIP.To4() != nil {
-									targetIP = ip6Hdr.SrcIP
+									targetIP = net.IP(srcIP6[:])
 								}
 								_ = RewriteIPv6TCP(rawPacket, nil, targetIP, 0, r.localProxyPort)
 								addr.SetOutbound(false) // Inbound to local proxy listener
@@ -596,57 +677,43 @@ func (r *Redirector) packetLoop(ctx context.Context, workerID int) {
 								_ = r.dll.CalcChecksums(rawPacket, &addr, 0)
 							}
 						}
-					} else if ip6Hdr != nil && ip6Hdr.NextHeader == IPPROTO_UDP {
+					} else if nextHdr == IPPROTO_UDP {
 						srcPort, dstPort, _, dataOffset, err := ParseUDPFast(rawPacket, ihl)
 						if err == nil {
 							if dstPort == 443 {
-								// ----------------------------------------------------
-								// IPv6 UDP 443 (HTTP/3 QUIC) Interception:
-								// Drop UDP 443 to force browsers to fallback to TCP/TLS.
-								// ----------------------------------------------------
+								// IPv6 UDP 443 QUIC: drop to force TCP
 								if !r.dryRun {
-									continue // Silently drop IPv6 QUIC packet
+									continue
 								}
 							} else if dstPort == 53 && r.dnsEng != nil && !r.dryRun {
-								// ----------------------------------------------------
-								// IPv6 UDP 53 DNS Interception & DoH Dynamic Upgrade
-								// ----------------------------------------------------
+								// IPv6 UDP 53 DNS Interception
 								payload := rawPacket[dataOffset:]
 								clientAddr := &net.UDPAddr{
-									IP:   ip6Hdr.SrcIP,
+									IP:   net.IP(srcIP6[:]),
 									Port: int(srcPort),
 								}
-								targetIP := ip6Hdr.DstIP
+								targetIP := net.IP(dstIP6[:])
 
 								rawCopy := append([]byte(nil), rawPacket...)
 								payloadCopy := append([]byte(nil), payload...)
 								origAddr := addr
 
-								go func(cAddr net.Addr, tIP net.IP, sPort, dPort uint16, pld, rPkt []byte, oAddr WinDivertAddress) {
-									defer func() {
-										if rec := recover(); rec != nil {
-											logger.Debugf("[DNS-v6] Recovered from panic in DNS handler: %v", rec)
-										}
-									}()
+								task := dnsTask{
+									clientAddr: clientAddr,
+									targetIP:   targetIP,
+									srcPort:    srcPort,
+									dstPort:    dstPort,
+									isIPv6:     true,
+									payload:    payloadCopy,
+									rawPacket:  rawCopy,
+									origAddr:   origAddr,
+								}
 
-									respData, passthrough := r.dnsEng.ProcessDNSQuery(ctx, cAddr, tIP, pld)
-									if passthrough {
-										sendAddr := oAddr
-										_, _ = r.dll.Send(r.handle, rPkt, &sendAddr)
-										return
-									}
-									if len(respData) > 0 {
-										respPkt := BuildIPv6UDPPacket(tIP, cAddr.(*net.UDPAddr).IP, dPort, sPort, respData)
-										if respPkt != nil {
-											injectAddr := oAddr
-											injectAddr.SetOutbound(false)
-											injectAddr.Flags |= WINDIVERT_ADDRESS_FLAG_IMPOSTOR
-											injectAddr.Flags &^= WINDIVERT_ADDRESS_FLAG_LOOPBACK
-											_ = r.dll.CalcChecksums(respPkt, &injectAddr, 0)
-											_, _ = r.dll.Send(r.handle, respPkt, &injectAddr)
-										}
-									}
-								}(clientAddr, targetIP, srcPort, dstPort, payloadCopy, rawCopy, origAddr)
+								select {
+								case r.dnsQueue <- task:
+								default:
+									go r.processDNSTask(ctx, task)
+								}
 
 								continue // Handled asynchronously
 							}
@@ -684,8 +751,9 @@ func (r *Redirector) sessionGCLoop(ctx context.Context) {
 			ticker := time.NewTicker(1 * time.Minute)
 			defer ticker.Stop()
 
-			// Safe TTL of 3 minutes for inactive sessions (active sessions have LastSeen updated per packet)
-			const sessionTTL = 3 * time.Minute
+			// Safe TTL of 24 hours for established sessions (active sessions have LastSeen updated per packet,
+			// and idle interactive sessions like RDP/SSH are kept alive via TCP Keep-Alive).
+			const sessionTTL = 24 * time.Hour
 
 			for {
 				select {

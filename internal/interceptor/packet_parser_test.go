@@ -43,14 +43,28 @@ func TestIsHTTPOrHTTPS(t *testing.T) {
 		t.Fatalf("Expected HTTP/llm.example.org, got isWeb=%v, proto=%s, domain=%s", isWeb, proto, domain)
 	}
 
-	// 3. Raw TCP / SSH banner test
+	// 3. SSH banner test
 	sshBanner := []byte("SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.1\r\n")
 	isWeb, proto, domain = IsHTTPOrHTTPS(sshBanner)
-	if isWeb || proto != "RAW_TCP" || domain != "" {
-		t.Fatalf("Expected RAW_TCP, got isWeb=%v, proto=%s, domain=%s", isWeb, proto, domain)
+	if isWeb || proto != "SSH" || domain != "" {
+		t.Fatalf("Expected SSH, got isWeb=%v, proto=%s, domain=%s", isWeb, proto, domain)
 	}
 
-	// 4. Empty payload test (Server-First protocol before client speaks)
+	// 4. RDP X.224 Connection Request PDU test
+	rdpPacket := []byte{0x03, 0x00, 0x00, 0x2b, 0x26, 0xe0, 0x00, 0x00, 0x00, 0x00, 0x00}
+	isWeb, proto, domain = IsHTTPOrHTTPS(rdpPacket)
+	if isWeb || proto != "RDP" || domain != "" {
+		t.Fatalf("Expected RDP, got isWeb=%v, proto=%s, domain=%s", isWeb, proto, domain)
+	}
+
+	// 5. VNC banner test
+	vncBanner := []byte("RFB 003.008\n")
+	isWeb, proto, domain = IsHTTPOrHTTPS(vncBanner)
+	if isWeb || proto != "VNC" || domain != "" {
+		t.Fatalf("Expected VNC, got isWeb=%v, proto=%s, domain=%s", isWeb, proto, domain)
+	}
+
+	// 6. Empty payload test (Server-First protocol before client speaks)
 	isWeb, proto, domain = IsHTTPOrHTTPS(nil)
 	if isWeb || proto != "RAW_TCP" || domain != "" {
 		t.Fatalf("Expected RAW_TCP on nil, got isWeb=%v, proto=%s, domain=%s", isWeb, proto, domain)
@@ -318,10 +332,10 @@ func TestParseIPv6Header(t *testing.T) {
 	if hdr.NextHeader != 6 {
 		t.Fatalf("Expected NextHeader 6, got %d", hdr.NextHeader)
 	}
-	if !hdr.SrcIP.Equal(srcIP) {
+	if !hdr.SrcNetIP().Equal(srcIP) {
 		t.Fatalf("Expected SrcIP %v, got %v", srcIP, hdr.SrcIP)
 	}
-	if !hdr.DstIP.Equal(dstIP) {
+	if !hdr.DstNetIP().Equal(dstIP) {
 		t.Fatalf("Expected DstIP %v, got %v", dstIP, hdr.DstIP)
 	}
 
@@ -476,7 +490,7 @@ func TestUDPParserAndBuilder(t *testing.T) {
 	if err != nil || ip6Hdr.NextHeader != IPPROTO_UDP {
 		t.Fatalf("ParseIPv6Header failed: nextHdr=%d, err=%v", ip6Hdr.NextHeader, err)
 	}
-	if !ip6Hdr.SrcIP.Equal(srcIPv6) || !ip6Hdr.DstIP.Equal(dstIPv6) {
+	if !ip6Hdr.SrcNetIP().Equal(srcIPv6) || !ip6Hdr.DstNetIP().Equal(dstIPv6) {
 		t.Errorf("IPv6 Addr mismatch: src=%v, dst=%v", ip6Hdr.SrcIP, ip6Hdr.DstIP)
 	}
 

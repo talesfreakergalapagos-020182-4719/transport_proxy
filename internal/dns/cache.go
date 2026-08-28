@@ -2,7 +2,6 @@ package dns
 
 import (
 	"encoding/binary"
-	"fmt"
 	"net"
 	"sync"
 	"time"
@@ -29,8 +28,23 @@ func NewCache(maxTTL time.Duration) *Cache {
 	}
 }
 
-func makeCacheKey(dstIP net.IP, qname string, qtype uint16) string {
-	return fmt.Sprintf("%s|%s|%d", dstIP.String(), qname, qtype)
+// CacheKey uniquely identifies a cached DNS query without string heap allocations.
+type CacheKey struct {
+	IP    [16]byte
+	QType uint16
+	QName string
+}
+
+func makeCacheKey(dstIP net.IP, qname string, qtype uint16) CacheKey {
+	var k CacheKey
+	if ip4 := dstIP.To4(); ip4 != nil {
+		copy(k.IP[:4], ip4)
+	} else {
+		copy(k.IP[:], dstIP)
+	}
+	k.QType = qtype
+	k.QName = qname
+	return k
 }
 
 // Get looks up a cached response for the given query and rewrites the transaction ID to match reqID.

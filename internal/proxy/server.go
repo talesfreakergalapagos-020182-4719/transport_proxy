@@ -3,10 +3,10 @@ package proxy
 import (
 	"context"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -183,29 +183,6 @@ func (s *Server) handleClient(ctx context.Context, clientConn net.Conn) {
 
 	forwarder := NewForwarder(cfg.BypassSSPI, cfg.ConnectTimeoutSec)
 
-	// Asynchronous Speculative Pre-Dialing:
-	// Concurrently start dialing targetAddr in the background while inspecting initial client payload (peek).
-	// This overlaps TCP 3-way handshake time with client ClientHello wait time, drastically reducing connection latency.
-	type preDialResult struct {
-		conn        net.Conn
-		preBuffered io.Reader
-		err         error
-	}
-	preDialChan := make(chan preDialResult, 1)
-	preDialCtx, cancelPreDial := context.WithCancel(ctx)
-	defer cancelPreDial()
-
-	go func() {
-		conn, preBuf, dialErr := forwarder.DialOutbound(targetAddr, "")
-		select {
-		case preDialChan <- preDialResult{conn: conn, preBuffered: preBuf, err: dialErr}:
-		case <-preDialCtx.Done():
-			if conn != nil {
-				_ = conn.Close()
-			}
-		}
-	}()
-
 	var initialData []byte
 	var isWeb bool
 	var protoType string
@@ -258,7 +235,7 @@ func (s *Server) handleClient(ctx context.Context, clientConn net.Conn) {
 	if s.filterEng.ShouldBlock(targetHostToCheck) {
 		log.Printf("[BLOCK] %-7s | Client: %-21s | Target: %-30s -> Blocked by policy",
 			protoType, clientConn.RemoteAddr(), targetDisplay)
-		return // Dropping connection sends FIN/RST to client (pre-dialed connection cleaned up by cancelPreDial)
+		return // Dropping connection sends FIN/RST to client
 	}
 
 	// If domain was identified, prefer domain:port for upstream CONNECT
@@ -295,29 +272,12 @@ func (s *Server) handleClient(ctx context.Context, clientConn net.Conn) {
 			protoType, clientConn.RemoteAddr(), targetDisplay)
 	}
 
-	// 5. Connect to upstream: Reuse pre-dialed DIRECT connection or dial configured upstream proxy
-	var outConn net.Conn
-	var preBuffered io.Reader
-
-	if proxyToUse == "" {
-		// DIRECT connection: obtain result from asynchronous pre-dial
-		res := <-preDialChan
-		if res.err != nil {
-			log.Printf("[ERROR] Outbound direct dial failed for %s: %v", targetToDial, res.err)
-			return
-		}
-		outConn = res.conn
-		preBuffered = res.preBuffered
-	} else {
-		// PROXY connection: cancel direct pre-dial and connect to upstream proxy
-		cancelPreDial()
-		logger.Debugf("[DEBUG] Dialing upstream proxy %s for target %s...", proxyToUse, targetToDial)
-		var dialErr error
-		outConn, preBuffered, dialErr = forwarder.DialOutbound(targetToDial, proxyToUse)
-		if dialErr != nil {
-			log.Printf("[ERROR] Outbound proxy dial failed for %s (Proxy: %q): %v", targetToDial, proxyToUse, dialErr)
-			return
-		}
+	// 5. Connect to upstream (DIRECT or configured upstream PROXY)
+	logger.Debugf("[DEBUG] Dialing upstream for target %s (Proxy: %q)...", targetToDial, proxyToUse)
+	outConn, preBuffered, dialErr := forwarder.DialOutbound(targetToDial, proxyToUse)
+	if dialErr != nil {
+		log.Printf("[ERROR] Outbound dial failed for %s (Proxy: %q): %v", targetToDial, proxyToUse, dialErr)
+		return
 	}
 
 	logger.Debugf("[DEBUG] Upstream connection established successfully (Local: %s -> Remote: %s)", outConn.LocalAddr(), outConn.RemoteAddr())
@@ -337,8 +297,16 @@ func (s *Server) handleClient(ctx context.Context, clientConn net.Conn) {
 	}
 
 	// 7. Bidirectional forwarding pipe
+	// 7. Bidirectional forwarding pipe
 	logger.Debugf("[DEBUG] Starting bidirectional data relay...")
-	bytesClientToUp, bytesUpToClient := PipeConn(clientConn, outConn, preBuffered, idleTimeout)
+	// Determine appropriate idle timeout:
+	// For interactive protocols (RDP, SSH, VNC, DB, TeamViewer, AnyDesk, Cloud VDI) or if explicitly disabled (cfg.IdleTimeoutSec <= 0),
+	// disable the read deadline (idleTimeout = 0) and rely on OS TCP Keep-Alive (30s) so idle sessions never drop!
+	connIdleTimeout := idleTimeout
+	if cfg.IdleTimeoutSec <= 0 || isInteractiveService(protoType, origPort, targetDomain) {
+		connIdleTimeout = 0
+	}
+	bytesClientToUp, bytesUpToClient := PipeConn(clientConn, outConn, preBuffered, connIdleTimeout)
 	duration := time.Since(startTime).Round(time.Millisecond)
 	totalSent := bytesClientToUp + int64(len(initialData))
 
@@ -377,6 +345,49 @@ func (s *Server) Close() error {
 	}
 
 	return err
+}
+
+// isInteractiveService returns true for remote desktop, terminal, database, or streaming protocols
+// where connections are long-lived and long idle periods (without user input) are expected.
+func isInteractiveService(protoType string, port uint16, domain string) bool {
+	// 1. Signature-detected interactive protocols (regardless of port number)
+	switch protoType {
+	case "RDP", "SSH", "VNC":
+		return true
+	}
+
+	// 2. Well-known interactive / remote administration / database ports
+	switch port {
+	case 22,   // SSH
+		23,    // Telnet
+		3389,  // Microsoft RDP
+		5900,  // VNC
+		5901,  // VNC display 1
+		5938,  // TeamViewer
+		7070,  // AnyDesk
+		1433,  // MSSQL
+		1521,  // Oracle DB
+		3306,  // MySQL / MariaDB
+		5432,  // PostgreSQL
+		6379,  // Redis
+		27017: // MongoDB
+		return true
+	}
+
+	// 3. Cloud Remote Desktop / VDI / Streaming domains
+	if domain != "" {
+		lower := strings.ToLower(domain)
+		if strings.Contains(lower, "remotedesktop") ||
+			strings.Contains(lower, "wvd.microsoft.com") ||
+			strings.Contains(lower, "anydesk.com") ||
+			strings.Contains(lower, "teamviewer.com") ||
+			strings.Contains(lower, "splashtop.com") ||
+			strings.Contains(lower, "logmein.com") {
+			return true
+		}
+	}
+
+	return false
 }
 
 // isServerFirstPort returns true for well-known server-first TCP services where the server

@@ -18,7 +18,7 @@ import (
 
 var bufferPool = sync.Pool{
 	New: func() any {
-		b := make([]byte, 64*1024)
+		b := make([]byte, 128*1024)
 		return &b
 	},
 }
@@ -235,23 +235,11 @@ func PipeConn(c1 net.Conn, c2 net.Conn, preBuffered io.Reader, idleTimeout time.
 
 		logger.Debugf("[PIPE-DOWN] Started: Upstream (%s) -> Client (%s)", c2.RemoteAddr(), c1.RemoteAddr())
 		firstRead := true
-		var lastDeadlineUpdate time.Time
 		if idleTimeout > 0 {
-			now := time.Now()
-			_ = c2.SetReadDeadline(now.Add(idleTimeout))
-			_ = c1.SetWriteDeadline(now.Add(idleTimeout))
-			lastDeadlineUpdate = now
+			_ = c2.SetReadDeadline(time.Now().Add(idleTimeout))
 		}
 
 		for {
-			if idleTimeout > 0 {
-				now := time.Now()
-				if now.Sub(lastDeadlineUpdate) >= deadlineRefreshInterval {
-					_ = c2.SetReadDeadline(now.Add(idleTimeout))
-					_ = c1.SetWriteDeadline(now.Add(idleTimeout))
-					lastDeadlineUpdate = now
-				}
-			}
 			if firstRead {
 				logger.Debugf("[PIPE-DOWN] Waiting for first byte from upstream %s...", c2.RemoteAddr())
 			}
@@ -261,6 +249,9 @@ func PipeConn(c1 net.Conn, c2 net.Conn, preBuffered io.Reader, idleTimeout time.
 				firstRead = false
 			}
 			if nr > 0 {
+				if idleTimeout > 0 {
+					_ = c2.SetReadDeadline(time.Now().Add(idleTimeout))
+				}
 				logger.Debugf("[PIPE-DOWN] Received %d bytes from upstream %s -> Writing to client %s", nr, c2.RemoteAddr(), c1.RemoteAddr())
 				nw, ew := c1.Write(buf[0:nr])
 				if nw > 0 {
@@ -312,25 +303,16 @@ func PipeConn(c1 net.Conn, c2 net.Conn, preBuffered io.Reader, idleTimeout time.
 		buf := *bufPtr
 
 		logger.Debugf("[PIPE-UP] Started: Client (%s) -> Upstream (%s)", c1.RemoteAddr(), c2.RemoteAddr())
-		var lastDeadlineUpdate time.Time
 		if idleTimeout > 0 {
-			now := time.Now()
-			_ = c1.SetReadDeadline(now.Add(idleTimeout))
-			_ = c2.SetWriteDeadline(now.Add(idleTimeout))
-			lastDeadlineUpdate = now
+			_ = c1.SetReadDeadline(time.Now().Add(idleTimeout))
 		}
 
 		for {
-			if idleTimeout > 0 {
-				now := time.Now()
-				if now.Sub(lastDeadlineUpdate) >= deadlineRefreshInterval {
-					_ = c1.SetReadDeadline(now.Add(idleTimeout))
-					_ = c2.SetWriteDeadline(now.Add(idleTimeout))
-					lastDeadlineUpdate = now
-				}
-			}
 			nr, er := c1.Read(buf)
 			if nr > 0 {
+				if idleTimeout > 0 {
+					_ = c1.SetReadDeadline(time.Now().Add(idleTimeout))
+				}
 				logger.Debugf("[PIPE-UP] Received %d bytes from client %s -> Forwarding to upstream %s", nr, c1.RemoteAddr(), c2.RemoteAddr())
 				nw, ew := c2.Write(buf[0:nr])
 				if nw > 0 {

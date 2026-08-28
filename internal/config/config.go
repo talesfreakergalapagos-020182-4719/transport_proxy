@@ -240,7 +240,7 @@ func (m *Manager) loadFile(path string) (*Config, time.Time, error) {
 	if cfg.ConnectTimeoutSec <= 0 {
 		cfg.ConnectTimeoutSec = 10
 	}
-	if cfg.IdleTimeoutSec <= 0 {
+	if cfg.IdleTimeoutSec < 0 {
 		cfg.IdleTimeoutSec = 120
 	}
 	if cfg.ReloadIntervalSec <= 0 {

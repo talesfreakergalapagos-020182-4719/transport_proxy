@@ -51,6 +51,20 @@ func BenchmarkSessionKeyLookup(b *testing.B) {
 	}
 }
 
+func BenchmarkParseIPv6Fast(b *testing.B) {
+	packet := make([]byte, 60)
+	packet[0] = 0x60 // IPv6 version 6
+	packet[6] = IPPROTO_TCP
+	copy(packet[8:24], net.ParseIP("2001:db8::1"))
+	copy(packet[24:40], net.ParseIP("2001:db8::2"))
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _, _, _, _, _ = ParseIPv6Fast(packet)
+	}
+}
+
 func BenchmarkParseIPv6Header(b *testing.B) {
 	packet := make([]byte, 60)
 	packet[0] = 0x60 // IPv6 version 6

@@ -14,33 +14,56 @@ type IPv6Header struct {
 	PayloadLen uint16
 	NextHeader uint8 // 6 = TCP, 17 = UDP
 	HopLimit   uint8
-	SrcIP      net.IP
-	DstIP      net.IP
+	SrcIP      [16]byte
+	DstIP      [16]byte
+}
+
+// SrcNetIP returns a standard net.IP representation of SrcIP.
+func (h *IPv6Header) SrcNetIP() net.IP {
+	return net.IP(h.SrcIP[:])
+}
+
+// DstNetIP returns a standard net.IP representation of DstIP.
+func (h *IPv6Header) DstNetIP() net.IP {
+	return net.IP(h.DstIP[:])
+}
+
+// ParseIPv6Fast parses a fixed 40-byte IPv6 header without heap allocations.
+func ParseIPv6Fast(data []byte) (nextHeader uint8, srcIP, dstIP [16]byte, payloadLen uint16, ihl int, err error) {
+	if len(data) < 40 {
+		return 0, srcIP, dstIP, 0, 0, ErrPacketTooShort
+	}
+	version := data[0] >> 4
+	if version != 6 {
+		return 0, srcIP, dstIP, 0, 0, fmt.Errorf("not an IPv6 packet: version %d", version)
+	}
+
+	payloadLen = binary.BigEndian.Uint16(data[4:6])
+	nextHeader = data[6]
+	copy(srcIP[:], data[8:24])
+	copy(dstIP[:], data[24:40])
+	return nextHeader, srcIP, dstIP, payloadLen, 40, nil
 }
 
 // ParseIPv6Header parses a fixed 40-byte IPv6 header.
 func ParseIPv6Header(data []byte) (*IPv6Header, int, error) {
-	if len(data) < 40 {
-		return nil, 0, fmt.Errorf("packet too short for IPv6 header: %d bytes", len(data))
-	}
-	version := data[0] >> 4
-	if version != 6 {
-		return nil, 0, fmt.Errorf("not an IPv6 packet: version %d", version)
+	nextHeader, srcIP, dstIP, payloadLen, ihl, err := ParseIPv6Fast(data)
+	if err != nil {
+		return nil, 0, err
 	}
 
-	hdr := &IPv6Header{
-		Version:    version,
-		PayloadLen: binary.BigEndian.Uint16(data[4:6]),
-		NextHeader: data[6],
+	return &IPv6Header{
+		Version:    data[0] >> 4,
+		PayloadLen: payloadLen,
+		NextHeader: nextHeader,
 		HopLimit:   data[7],
-		SrcIP:      append(net.IP(nil), data[8:24]...),
-		DstIP:      append(net.IP(nil), data[24:40]...),
-	}
-	return hdr, 40, nil
+		SrcIP:      srcIP,
+		DstIP:      dstIP,
+	}, ihl, nil
 }
 
-// IsHTTPOrHTTPS inspects initial payload bytes to determine if the traffic is HTTP or HTTPS (TLS).
-// Returns isWeb=true if detected as HTTP or HTTPS, the protocol label ("HTTPS", "HTTP", or "RAW_TCP"), and extracted domain.
+// IsHTTPOrHTTPS inspects initial payload bytes to determine the protocol (HTTPS, HTTP, RDP, SSH, VNC, or RAW_TCP).
+// Returns isWeb=true if detected as HTTP or HTTPS, the protocol label ("HTTPS", "HTTP", "RDP", "SSH", "VNC", or "RAW_TCP"), and extracted domain.
 func IsHTTPOrHTTPS(data []byte) (isWeb bool, protoType string, targetDomain string) {
 	if len(data) == 0 {
 		return false, "RAW_TCP", ""
@@ -61,9 +84,25 @@ func IsHTTPOrHTTPS(data []byte) (isWeb bool, protoType string, targetDomain stri
 		bytes.HasPrefix(data, []byte("CONNECT ")) ||
 		bytes.HasPrefix(data, []byte("OPTIONS ")) ||
 		bytes.HasPrefix(data, []byte("PATCH ")) ||
-		bytes.HasPrefix(data, []byte("TRACE ")) {
+		bytes.HasPrefix(data, []byte("TRACE ")) ||
+		bytes.HasPrefix(data, []byte("PRI * HTTP/2.0")) {
 		host := ExtractHTTPHost(data)
 		return true, "HTTP", host
+	}
+
+	// 3. Check Microsoft RDP (TPKT v3 + X.224 Connection Request PDU: 0x03 0x00 ... 0xe0)
+	if len(data) >= 6 && data[0] == 0x03 && data[1] == 0x00 && (data[5] == 0xe0 || data[5] == 0xd0) {
+		return false, "RDP", ""
+	}
+
+	// 4. Check SSH Identification Banner ("SSH-")
+	if bytes.HasPrefix(data, []byte("SSH-")) {
+		return false, "SSH", ""
+	}
+
+	// 5. Check VNC Identification Banner ("RFB ")
+	if bytes.HasPrefix(data, []byte("RFB ")) {
+		return false, "VNC", ""
 	}
 
 	return false, "RAW_TCP", ""
@@ -318,7 +357,46 @@ func cleanHostBytes(h []byte) string {
 	return string(h)
 }
 
-// RewriteIPv4TCP modifies destination IP/port or source IP/port in an IPv4 TCP packet in-place.
+// UpdateChecksum16 incrementally updates a 16-bit one's complement checksum (RFC 1624 Eqn. 3)
+// when a 16-bit word changes from oldVal to newVal:
+//   HC' = ~(~HC + ~m + m')
+func UpdateChecksum16(oldCsum, oldVal, newVal uint16) uint16 {
+	sum := uint32(^oldCsum) + uint32(^oldVal) + uint32(newVal)
+	for sum > 0xffff {
+		sum = (sum >> 16) + (sum & 0xffff)
+	}
+	return ^uint16(sum)
+}
+
+// UpdateChecksum32 incrementally updates a 16-bit checksum when a 32-bit word changes.
+func UpdateChecksum32(oldCsum uint16, oldVal, newVal uint32) uint16 {
+	oldHigh := uint16(oldVal >> 16)
+	oldLow := uint16(oldVal & 0xffff)
+	newHigh := uint16(newVal >> 16)
+	newLow := uint16(newVal & 0xffff)
+	sum := uint32(^oldCsum) + uint32(^oldHigh) + uint32(newHigh) + uint32(^oldLow) + uint32(newLow)
+	for sum > 0xffff {
+		sum = (sum >> 16) + (sum & 0xffff)
+	}
+	return ^uint16(sum)
+}
+
+// UpdateChecksumIPv6Bytes incrementally updates a 16-bit checksum when a 16-byte IPv6 address changes.
+func UpdateChecksumIPv6Bytes(oldCsum uint16, oldIP, newIP [16]byte) uint16 {
+	sum := uint32(^oldCsum)
+	for i := 0; i < 16; i += 2 {
+		oldWord := binary.BigEndian.Uint16(oldIP[i : i+2])
+		newWord := binary.BigEndian.Uint16(newIP[i : i+2])
+		sum += uint32(^oldWord) + uint32(newWord)
+	}
+	for sum > 0xffff {
+		sum = (sum >> 16) + (sum & 0xffff)
+	}
+	return ^uint16(sum)
+}
+
+// RewriteIPv4TCP modifies destination IP/port or source IP/port in an IPv4 TCP packet in-place,
+// and incrementally recalculates both IP and TCP checksums in O(1) time (RFC 1624).
 func RewriteIPv4TCP(packet []byte, newSrcIP, newDstIP net.IP, newSrcPort, newDstPort uint16) error {
 	if len(packet) < 40 {
 		return ErrPacketTooShort
@@ -329,31 +407,61 @@ func RewriteIPv4TCP(packet []byte, newSrcIP, newDstIP net.IP, newSrcPort, newDst
 		return ErrPacketTooShort
 	}
 
-	// Update IPv4 addresses
+	ipCsum := binary.BigEndian.Uint16(packet[10:12])
+	tcpOffset := ihl
+	tcpCsum := binary.BigEndian.Uint16(packet[tcpOffset+16 : tcpOffset+18])
+
+	// Update IPv4 source address
 	if newSrcIP != nil {
 		if ip4 := newSrcIP.To4(); ip4 != nil {
-			copy(packet[12:16], ip4)
+			oldSrc := binary.BigEndian.Uint32(packet[12:16])
+			newSrc := binary.BigEndian.Uint32(ip4)
+			if oldSrc != newSrc {
+				ipCsum = UpdateChecksum32(ipCsum, oldSrc, newSrc)
+				tcpCsum = UpdateChecksum32(tcpCsum, oldSrc, newSrc)
+				copy(packet[12:16], ip4)
+			}
 		}
 	}
+
+	// Update IPv4 destination address
 	if newDstIP != nil {
 		if ip4 := newDstIP.To4(); ip4 != nil {
-			copy(packet[16:20], ip4)
+			oldDst := binary.BigEndian.Uint32(packet[16:20])
+			newDst := binary.BigEndian.Uint32(ip4)
+			if oldDst != newDst {
+				ipCsum = UpdateChecksum32(ipCsum, oldDst, newDst)
+				tcpCsum = UpdateChecksum32(tcpCsum, oldDst, newDst)
+				copy(packet[16:20], ip4)
+			}
 		}
 	}
 
-	// Update TCP ports
-	tcpOffset := ihl
+	// Update TCP source port
 	if newSrcPort != 0 {
-		binary.BigEndian.PutUint16(packet[tcpOffset:tcpOffset+2], newSrcPort)
-	}
-	if newDstPort != 0 {
-		binary.BigEndian.PutUint16(packet[tcpOffset+2:tcpOffset+4], newDstPort)
+		oldPort := binary.BigEndian.Uint16(packet[tcpOffset : tcpOffset+2])
+		if oldPort != newSrcPort {
+			tcpCsum = UpdateChecksum16(tcpCsum, oldPort, newSrcPort)
+			binary.BigEndian.PutUint16(packet[tcpOffset:tcpOffset+2], newSrcPort)
+		}
 	}
 
+	// Update TCP destination port
+	if newDstPort != 0 {
+		oldPort := binary.BigEndian.Uint16(packet[tcpOffset+2 : tcpOffset+4])
+		if oldPort != newDstPort {
+			tcpCsum = UpdateChecksum16(tcpCsum, oldPort, newDstPort)
+			binary.BigEndian.PutUint16(packet[tcpOffset+2:tcpOffset+4], newDstPort)
+		}
+	}
+
+	binary.BigEndian.PutUint16(packet[10:12], ipCsum)
+	binary.BigEndian.PutUint16(packet[tcpOffset+16:tcpOffset+18], tcpCsum)
 	return nil
 }
 
-// RewriteIPv6TCP modifies destination IP/port or source IP/port in an IPv6 TCP packet in-place.
+// RewriteIPv6TCP modifies destination IP/port or source IP/port in an IPv6 TCP packet in-place,
+// and incrementally recalculates TCP checksum in O(1) time (RFC 1624).
 func RewriteIPv6TCP(packet []byte, newSrcIP, newDstIP net.IP, newSrcPort, newDstPort uint16) error {
 	if len(packet) < 60 { // 40 bytes IPv6 header + 20 bytes TCP minimum header
 		return ErrPacketTooShort
@@ -364,27 +472,56 @@ func RewriteIPv6TCP(packet []byte, newSrcIP, newDstIP net.IP, newSrcPort, newDst
 		return fmt.Errorf("not an IPv6 packet: version %d", version)
 	}
 
-	// Update IPv6 addresses (SrcIP: 8..24, DstIP: 24..40)
+	const tcpOffset = 40
+	tcpCsum := binary.BigEndian.Uint16(packet[tcpOffset+16 : tcpOffset+18])
+
+	// Update IPv6 source address (SrcIP: 8..24)
 	if newSrcIP != nil {
 		if ip6 := newSrcIP.To16(); ip6 != nil {
-			copy(packet[8:24], ip6)
+			var oldSrc [16]byte
+			copy(oldSrc[:], packet[8:24])
+			var newSrc [16]byte
+			copy(newSrc[:], ip6)
+			if oldSrc != newSrc {
+				tcpCsum = UpdateChecksumIPv6Bytes(tcpCsum, oldSrc, newSrc)
+				copy(packet[8:24], ip6)
+			}
 		}
 	}
+
+	// Update IPv6 destination address (DstIP: 24..40)
 	if newDstIP != nil {
 		if ip6 := newDstIP.To16(); ip6 != nil {
-			copy(packet[24:40], ip6)
+			var oldDst [16]byte
+			copy(oldDst[:], packet[24:40])
+			var newDst [16]byte
+			copy(newDst[:], ip6)
+			if oldDst != newDst {
+				tcpCsum = UpdateChecksumIPv6Bytes(tcpCsum, oldDst, newDst)
+				copy(packet[24:40], ip6)
+			}
 		}
 	}
 
-	// Update TCP ports (fixed IPv6 header length is 40 bytes)
-	const tcpOffset = 40
+	// Update TCP source port
 	if newSrcPort != 0 {
-		binary.BigEndian.PutUint16(packet[tcpOffset:tcpOffset+2], newSrcPort)
-	}
-	if newDstPort != 0 {
-		binary.BigEndian.PutUint16(packet[tcpOffset+2:tcpOffset+4], newDstPort)
+		oldPort := binary.BigEndian.Uint16(packet[tcpOffset : tcpOffset+2])
+		if oldPort != newSrcPort {
+			tcpCsum = UpdateChecksum16(tcpCsum, oldPort, newSrcPort)
+			binary.BigEndian.PutUint16(packet[tcpOffset:tcpOffset+2], newSrcPort)
+		}
 	}
 
+	// Update TCP destination port
+	if newDstPort != 0 {
+		oldPort := binary.BigEndian.Uint16(packet[tcpOffset+2 : tcpOffset+4])
+		if oldPort != newDstPort {
+			tcpCsum = UpdateChecksum16(tcpCsum, oldPort, newDstPort)
+			binary.BigEndian.PutUint16(packet[tcpOffset+2:tcpOffset+4], newDstPort)
+		}
+	}
+
+	binary.BigEndian.PutUint16(packet[tcpOffset+16:tcpOffset+18], tcpCsum)
 	return nil
 }
 

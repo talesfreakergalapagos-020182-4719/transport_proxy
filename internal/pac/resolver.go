@@ -28,8 +28,7 @@ type Resolver struct {
 	isPACMode   bool
 	session     *WinHTTPSession
 	mu          sync.RWMutex
-	cache       map[string]cachedEntry
-	cacheMu     sync.RWMutex
+	cache       sync.Map // map[string]*cachedEntry (lock-free concurrent cache)
 	stopChan    chan struct{}
 }
 
@@ -43,7 +42,6 @@ func NewResolver(pacURL string, staticProxy string) (*Resolver, error) {
 	r := &Resolver{
 		pacURL:      strings.TrimSpace(pacURL),
 		staticProxy: strings.TrimSpace(staticProxy),
-		cache:       make(map[string]cachedEntry),
 		stopChan:    make(chan struct{}),
 	}
 
@@ -141,9 +139,10 @@ func (r *Resolver) UpdateConfig(pacURL string, staticProxy string) {
 		r.isPACMode = true
 	}
 
-	r.cacheMu.Lock()
-	r.cache = make(map[string]cachedEntry) // Clear cache on config change
-	r.cacheMu.Unlock()
+	r.cache.Range(func(key, value any) bool {
+		r.cache.Delete(key)
+		return true
+	})
 
 	if r.isPACMode {
 		if r.session == nil {
@@ -204,15 +203,14 @@ func (r *Resolver) Resolve(targetHost string, targetPort uint16) (ProxyDecision,
 	}
 	targetURL := fmt.Sprintf("%s://%s", scheme, net.JoinHostPort(hostOnly, fmt.Sprintf("%d", targetPort)))
 
-	// Check bounded cache
+	// Check lock-free cache
 	now := time.Now()
-	r.cacheMu.RLock()
-	entry, found := r.cache[targetURL]
-	if found && now.Before(entry.expiresAt) {
-		r.cacheMu.RUnlock()
-		return entry.decision, nil
+	if val, found := r.cache.Load(targetURL); found {
+		entry := val.(*cachedEntry)
+		if now.Before(entry.expiresAt) {
+			return entry.decision, nil
+		}
 	}
-	r.cacheMu.RUnlock()
 
 	isDirect, rawProxyList, err := session.GetProxyForURL(targetURL, pacURL)
 	if err != nil {
@@ -221,12 +219,10 @@ func (r *Resolver) Resolve(targetHost string, targetPort uint16) (ProxyDecision,
 		if staticProxy != "" {
 			fallbackDecision = ProxyDecision{IsDirect: false, ProxyURL: normalizeProxyURL(staticProxy)}
 		}
-		r.cacheMu.Lock()
-		r.cache[targetURL] = cachedEntry{
+		r.cache.Store(targetURL, &cachedEntry{
 			decision:  fallbackDecision,
 			expiresAt: now.Add(1 * time.Minute),
-		}
-		r.cacheMu.Unlock()
+		})
 		return fallbackDecision, nil
 	}
 
@@ -243,24 +239,11 @@ func (r *Resolver) Resolve(targetHost string, targetPort uint16) (ProxyDecision,
 		}
 	}
 
-	// Store in bounded cache
-	r.cacheMu.Lock()
-	if len(r.cache) >= maxCacheEntries {
-		// Force flush a small number of entries pseudo-randomly to avoid O(N) full scan blocking
-		i := 0
-		for k := range r.cache {
-			delete(r.cache, k)
-			i++
-			if i >= 50 {
-				break
-			}
-		}
-	}
-	r.cache[targetURL] = cachedEntry{
+	// Store in cache
+	r.cache.Store(targetURL, &cachedEntry{
 		decision:  decision,
 		expiresAt: now.Add(cacheTTL),
-	}
-	r.cacheMu.Unlock()
+	})
 
 	return decision, nil
 }
@@ -287,13 +270,13 @@ func (r *Resolver) cacheCleanupLoop() {
 			return
 		case <-ticker.C:
 			now := time.Now()
-			r.cacheMu.Lock()
-			for k, v := range r.cache {
-				if now.After(v.expiresAt) {
-					delete(r.cache, k)
+			r.cache.Range(func(k, v any) bool {
+				entry := v.(*cachedEntry)
+				if now.After(entry.expiresAt) {
+					r.cache.Delete(k)
 				}
-			}
-			r.cacheMu.Unlock()
+				return true
+			})
 		}
 	}
 }
