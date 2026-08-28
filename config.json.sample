@@ -1,0 +1,72 @@
+{
+  "doh_enabled": true,
+  "log_file": "",
+  "pac_url": "http://proxy.corp.local/proxy.pac",
+  "upstream_proxy": "",
+  "filter_mode": "whitelist",
+  "allowed_domains": [
+    "*.windowsupdate.com",
+    "*.windowsupdate.microsoft.com",
+    "*.update.microsoft.com",
+    "*.delivery.mp.microsoft.com",
+    "*.download.windowsupdate.com",
+    "*.download.microsoft.com",
+    "*.wns.windows.com",
+    "*.msftconnecttest.com",
+    "*.microsoft.com",
+
+    "github.com",
+    "*.github.com",
+    "*.githubusercontent.com",
+    "*.githubassets.com",
+    "gitlab.com",
+    "*.gitlab.com",
+
+    "go.dev",
+    "*.go.dev",
+    "golang.org",
+    "*.golang.org",
+
+    "npmjs.com",
+    "*.npmjs.com",
+    "npmjs.org",
+    "*.npmjs.org",
+    "registry.yarnpkg.com",
+
+    "pypi.org",
+    "*.pypi.org",
+    "pythonhosted.org",
+    "*.pythonhosted.org",
+    "python.org",
+    "*.python.org",
+
+    "crates.io",
+    "*.crates.io",
+    "rust-lang.org",
+    "*.rust-lang.org",
+
+    "docker.com",
+    "*.docker.com",
+    "docker.io",
+    "*.docker.io",
+
+    "stackoverflow.com",
+    "*.stackoverflow.com",
+
+    "google.com",
+    "*.google.com",
+    "*.googleapis.com",
+    "*.gstatic.com",
+
+    "*.visualstudio.com",
+    "*.vscode.dev"
+  ],
+  "allowed_ips": [
+    "127.0.0.1",
+    "::1",
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "fe80::/10"
+  ]
+}

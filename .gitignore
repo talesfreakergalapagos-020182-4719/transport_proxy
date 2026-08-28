@@ -1,0 +1,31 @@
+# Binaries and executables
+*.exe
+*.exe~
+*.dll
+*.sys
+
+# Test binaries and coverage
+*.test
+*.out
+cover.out
+
+# IDE and OS metadata
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Configuration (user specific)
+config.json
+!config.json.sample
+
+# Logs
+*.log
+log.txt
+
+# Local build and module cache
+.gocache/
+.gopath/
+
