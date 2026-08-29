@@ -105,6 +105,11 @@ func (r *Redirector) Start(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("failed to listen on local DNS UDP port %d: %w", r.localDNSUDPPort, err)
 		}
+		
+		if err := setupUDPSocketOptions(conn); err != nil {
+			log.Printf("[Redirector] Warning: Failed to set UDP original destination socket options: %v", err)
+		}
+
 		r.dnsUDPConn = conn
 		go r.dnsListenerLoop(ctx)
 		log.Printf("[Redirector] DNS UDP Interceptor listening on 127.0.0.1:%d", r.localDNSUDPPort)
@@ -226,8 +231,45 @@ func (r *Redirector) LookupOriginalDestinationConn(conn net.Conn) (net.IP, uint1
 func (r *Redirector) DeleteSession(clientAddr net.Addr) {
 }
 
+func setupUDPSocketOptions(conn *net.UDPConn) error {
+	rawConn, err := conn.SyscallConn()
+	if err != nil {
+		return err
+	}
+	return rawConn.Control(func(fd uintptr) {
+		// IPv4 IP_RECVORIGDSTADDR (SOL_IP = 0, IP_RECVORIGDSTADDR = 20)
+		_ = syscall.SetsockoptInt(int(fd), syscall.SOL_IP, 20, 1)
+		// IPv6 IPV6_RECVORIGDSTADDR (SOL_IPV6 = 41, IPV6_RECVORIGDSTADDR = 74)
+		_ = syscall.SetsockoptInt(int(fd), syscall.SOL_IPV6, 74, 1)
+	})
+}
+
+func extractOrigDstIP(oob []byte) net.IP {
+	msgs, err := syscall.ParseSocketControlMessage(oob)
+	if err != nil {
+		return nil
+	}
+	for _, msg := range msgs {
+		if msg.Header.Level == syscall.SOL_IP && msg.Header.Type == 20 { // IP_RECVORIGDSTADDR
+			if len(msg.Data) >= 8 {
+				return net.IPv4(msg.Data[4], msg.Data[5], msg.Data[6], msg.Data[7])
+			}
+		}
+		if msg.Header.Level == syscall.SOL_IPV6 && msg.Header.Type == 74 { // IPV6_RECVORIGDSTADDR
+			if len(msg.Data) >= 24 {
+				ip := make(net.IP, 16)
+				copy(ip, msg.Data[8:24])
+				return ip
+			}
+		}
+	}
+	return nil
+}
+
 func (r *Redirector) dnsListenerLoop(ctx context.Context) {
 	buf := make([]byte, 4096)
+	oob := make([]byte, 2048)
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -235,7 +277,7 @@ func (r *Redirector) dnsListenerLoop(ctx context.Context) {
 		default:
 		}
 
-		n, clientAddr, err := r.dnsUDPConn.ReadFrom(buf)
+		n, oobn, _, clientAddr, err := r.dnsUDPConn.ReadMsgUDP(buf, oob)
 		if err != nil {
 			r.mu.Lock()
 			isClosed := r.closed
@@ -249,15 +291,20 @@ func (r *Redirector) dnsListenerLoop(ctx context.Context) {
 		queryData := make([]byte, n)
 		copy(queryData, buf[:n])
 
-		go func(cAddr net.Addr, qData []byte) {
+		origIP := extractOrigDstIP(oob[:oobn])
+		if origIP == nil {
+			origIP = net.IPv4(127, 0, 0, 1) // Fallback
+		}
+
+		go func(cAddr net.Addr, qData []byte, dstIP net.IP) {
 			if r.dnsEng == nil {
 				return
 			}
-			respData, passthrough := r.dnsEng.ProcessDNSQuery(ctx, cAddr, net.IPv4(127, 0, 0, 1), qData)
+			respData, passthrough := r.dnsEng.ProcessDNSQuery(ctx, cAddr, dstIP, qData)
 			if !passthrough && len(respData) > 0 {
 				_, _ = r.dnsUDPConn.WriteTo(respData, cAddr)
 			}
-		}(clientAddr, queryData)
+		}(clientAddr, queryData, origIP)
 	}
 }
 
