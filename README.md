@@ -171,6 +171,33 @@ curl -v https://www.google.com
 
 設定ファイルは **アプリ稼働中に編集・保存しても、再起動不要で即座に自動反映（ホットリロード）** されます。
 
+### 📋 全設定パラメータ一覧（完全リファレンス）
+
+| キー名 | 型 | デフォルト値 | 説明 |
+| :--- | :---: | :---: | :--- |
+| **`filter_mode`** | `string` | `"whitelist"` | フィルタリングモード。`"whitelist"`（許可リストのみ）、`"blacklist"`（拒否リストのみ）、`"all"` / `"none"`（全通し）から選択。 |
+| **`allowed_domains`** | `[]string` | `[]` | ホワイトリスト時に通信を許可するドメイン・ワイルドカード一覧（例: `["*.github.com", "google.com"]`）。 |
+| **`allowed_ips`** | `[]string` | `[]` | ホワイトリスト時に通信を許可する IP アドレス / CIDR 一覧（例: `["127.0.0.1", "10.0.0.0/8"]`）。 |
+| **`blocked_domains`** | `[]string` | `[]` | ブラックリスト時に通信を遮断するドメイン・ワイルドカード一覧（例: `["*.badsite.com"]`）。 |
+| **`blocked_ips`** | `[]string` | `[]` | ブラックリスト時に通信を遮断する IP アドレス / CIDR 一覧（例: `["198.51.100.25", "203.0.113.0/24"]`）。 |
+| **`listen_addr`** | `string` | `"0.0.0.0:18080"` | ローカルプロキシサーバーの待受けアドレス（ポート衝突時は自動で別ポートへ退避）。 |
+| **`pac_url`** | `string` | `""` | 上位プロキシ自動構成スクリプト（PAC/WPAD）の URL（例: `"http://wpad.corp.local/wpad.dat"`）。 |
+| **`upstream_proxy`** | `string` | `""` | 固定上位 HTTP プロキシ URL（例: `"http://proxy.corp.local:8080"`）。 |
+| **`bypass_sspi`** | `bool` | `false` | `true` にすると上位プロキシへの Windows 統合認証（SSPI / NTLM / Kerberos）を無効化。 |
+| **`doh_enabled`** | `bool` | `true` | 平文 DNS（UDP 53）を DNS-over-HTTPS (DoH) へ自動昇格する機能の有効/無効。 |
+| **`doh_timeout_sec`** | `int` | `3` | DoH クエリのタイムアウト秒数。 |
+| **`fallback_to_udp`** | `bool` | `true` | DoH 失敗時または非対応の際、平文 UDP 53 へフォールバックするかどうか。 |
+| **`dns_cache_enabled`** | `bool` | `true` | インメモリ DNS キャッシュ（2回目以降 0ms 応答）の有効/無効。 |
+| **`dns_cache_ttl_sec`** | `int` | `300` | DNS キャッシュの最大保持秒数（TTL）。 |
+| **`connect_timeout_sec`**| `int` | `10` | 上流サーバー / 上位プロキシへの TCP 接続タイムアウト秒数。 |
+| **`idle_timeout_sec`** | `int` | `120` | アイドル（無通信）接続の切断秒数。`0` にすると無制限維持。 |
+| **`reload_interval_sec`**| `int` | `5` | 設定ファイルの変更検知＆ホットリロードの確認周期（秒）。 |
+| **`log_file`** | `string` | `""` | ログ出力先のファイルパス（例: `"log.txt"`）。空文字の場合はコンソールのみ。 |
+| **`dry_run`** | `bool` | `false` | `true` にすると通信を遮断・変更せず監査ログ出力のみを行うドライランモードで動作。 |
+| **`divert_filter`** | `string` | `""` (自動生成) | WinDivert のカスタムキャプチャ条件（※通常は空文字推奨。指定時は `outbound` と `!loopback` を必須付与）。 |
+
+---
+
 ### パターン 1: ホワイトリスト形式（おすすめ・セキュア運用）
 指定したドメイン・IP 宛てのみを許可し、未知のサイトをすべて自動遮断します（Windows / WSL 双方に共通適用）：
 ```json
@@ -202,10 +229,8 @@ curl -v https://www.google.com
 {
   "filter_mode": "blacklist",
   "blocked_domains": [
-    "*.badsite.com",
-    "*.tiktok.com",
-    "twitter.com",
-    "x.com"
+    "*.example-blocked.com",
+    "badsite.example.org"
   ],
   "blocked_ips": [
     "198.51.100.25",
