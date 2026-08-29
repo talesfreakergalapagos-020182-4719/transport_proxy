@@ -323,8 +323,98 @@ func (s *Server) handleClient(ctx context.Context, clientConn net.Conn) {
 		duration)
 }
 
+var (
+	localSubnetsCache   []*net.IPNet
+	localIPsCache       []net.IP
+	localSubnetCacheMut sync.RWMutex
+	lastCacheUpdate     time.Time
+)
+
+func updateLocalInterfaceCache() {
+	localSubnetCacheMut.Lock()
+	defer localSubnetCacheMut.Unlock()
+
+	if time.Since(lastCacheUpdate) < 30*time.Second && (len(localIPsCache) > 0 || len(localSubnetsCache) > 0) {
+		return
+	}
+
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return
+	}
+
+	var ips []net.IP
+	var subnets []*net.IPNet
+
+	for _, iface := range ifaces {
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+
+		isVirtualWSL := strings.Contains(strings.ToLower(iface.Name), "wsl") ||
+			strings.Contains(strings.ToLower(iface.Name), "hyper-v") ||
+			strings.Contains(strings.ToLower(iface.Name), "vethernet")
+
+		for _, a := range addrs {
+			if ipNet, ok := a.(*net.IPNet); ok {
+				ips = append(ips, ipNet.IP)
+				if isVirtualWSL {
+					subnets = append(subnets, ipNet)
+				}
+			}
+		}
+	}
+
+	localIPsCache = ips
+	localSubnetsCache = subnets
+	lastCacheUpdate = time.Now()
+}
+
+// isAuthorizedLocalClient checks if the client connection originates from the local host or WSL.
+func isAuthorizedLocalClient(remoteAddr net.Addr) bool {
+	host, _, err := net.SplitHostPort(remoteAddr.String())
+	if err != nil {
+		host = remoteAddr.String()
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	// 1. Loopback addresses (127.0.0.1, ::1) -> Localhost and WSL Mirrored mode (0 alloc, <1ns)
+	if ip.IsLoopback() {
+		return true
+	}
+
+	// 2. Check cached local network interfaces
+	updateLocalInterfaceCache()
+
+	localSubnetCacheMut.RLock()
+	defer localSubnetCacheMut.RUnlock()
+
+	for _, localIP := range localIPsCache {
+		if localIP.Equal(ip) {
+			return true
+		}
+	}
+	for _, subnet := range localSubnetsCache {
+		if subnet.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
 // handleExplicitProxyClient handles explicit HTTP and HTTPS CONNECT proxy requests (e.g. from WSL via http_proxy).
 func (s *Server) handleExplicitProxyClient(ctx context.Context, clientConn net.Conn) {
+	// Security Check: Only allow explicit proxy connections originating from local host or WSL
+	if !isAuthorizedLocalClient(clientConn.RemoteAddr()) {
+		log.Printf("[BLOCK] EXPLICIT PROXY | Client: %-21s -> Blocked: unauthorized external client (only localhost/WSL allowed)",
+			clientConn.RemoteAddr())
+		_, _ = clientConn.Write([]byte("HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nAccess denied: proxy is restricted to local host and WSL\n"))
+		return
+	}
+
 	cfg := s.cfgMgr.Get()
 	connectTimeout := time.Duration(cfg.ConnectTimeoutSec) * time.Second
 	idleTimeout := time.Duration(cfg.IdleTimeoutSec) * time.Second

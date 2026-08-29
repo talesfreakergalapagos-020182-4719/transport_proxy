@@ -708,3 +708,27 @@ func TestIntegration_ExplicitProxyCONNECTAndHTTP(t *testing.T) {
 	})
 }
 
+func Test_isAuthorizedLocalClient(t *testing.T) {
+	// 1. Loopback addresses should be authorized
+	loopbackV4, _ := net.ResolveTCPAddr("tcp", "127.0.0.1:12345")
+	if !isAuthorizedLocalClient(loopbackV4) {
+		t.Errorf("Expected 127.0.0.1 to be authorized")
+	}
+
+	loopbackV6, _ := net.ResolveTCPAddr("tcp", "[::1]:12345")
+	if !isAuthorizedLocalClient(loopbackV6) {
+		t.Errorf("Expected [::1] to be authorized")
+	}
+
+	// 2. External public or unrelated private IP should NOT be authorized
+	externalIP1, _ := net.ResolveTCPAddr("tcp", "203.0.113.50:12345")
+	if isAuthorizedLocalClient(externalIP1) {
+		t.Errorf("Expected external IP 203.0.113.50 to be rejected")
+	}
+
+	externalIP2, _ := net.ResolveTCPAddr("tcp", "198.51.100.99:12345")
+	if isAuthorizedLocalClient(externalIP2) {
+		t.Errorf("Expected external IP 198.51.100.99 to be rejected")
+	}
+}
+
