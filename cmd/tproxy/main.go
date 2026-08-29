@@ -201,6 +201,7 @@ func main() {
 
 	actualListenAddr := fmt.Sprintf("0.0.0.0:%d", localPort)
 	forwardCond, fullFilter := cfg.BuildDivertFilter(localPort)
+	forwardLayerFilter := cfg.BuildForwardDivertFilter(localPort)
 
 	redirector, err := interceptor.NewRedirector(actualListenAddr, fullFilter)
 	if err != nil {
@@ -209,6 +210,7 @@ func main() {
 		}
 		log.Fatalf("[FATAL] Failed to initialize WinDivert redirector: %v", err)
 	}
+	redirector.SetForwardLayer(forwardLayerFilter, cfg.ForwardLayerEnabled)
 	redirector.SetDryRun(isDryRun, forwardCond, filterEng, pacResolver)
 
 	// 5. Initialize DNS-to-DoH Engine

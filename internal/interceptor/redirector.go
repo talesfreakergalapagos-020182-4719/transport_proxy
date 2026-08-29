@@ -104,22 +104,25 @@ type DNSEvaluator interface {
 
 // Redirector handles WinDivert packet interception, bi-directional NAT, session tracking, and dry-run auditing.
 type Redirector struct {
-	dll            *WinDivertDLL
-	handle         syscall.Handle
-	filterStr      string
-	localProxyPort uint16
-	localProxyIP   net.IP
-	pid            int
-	sessions       sync.Map // map[SessionKey]*SessionInfo
-	dryRunSessions sync.Map // map[SessionKey]*dryRunSessionInfo for deduplicating dry-run audit logs
-	dryRun         bool
-	filterEng      FilterEvaluator
-	routingEng     RoutingEvaluator
-	dnsEng         DNSEvaluator
-	coarseNano     atomic.Int64
-	dnsQueue       chan dnsTask
-	mu             sync.Mutex
-	closed         bool
+	dll              *WinDivertDLL
+	handle           syscall.Handle // Layer 0: WINDIVERT_LAYER_NETWORK (Host outbound/inbound)
+	forwardHandle    syscall.Handle // Layer 1: WINDIVERT_LAYER_NETWORK_FORWARD (Routed/forwarded traffic)
+	filterStr        string
+	forwardFilterStr string
+	forwardEnabled   bool
+	localProxyPort   uint16
+	localProxyIP     net.IP
+	pid              int
+	sessions         sync.Map // map[SessionKey]*SessionInfo
+	dryRunSessions   sync.Map // map[SessionKey]*dryRunSessionInfo for deduplicating dry-run audit logs
+	dryRun           bool
+	filterEng        FilterEvaluator
+	routingEng       RoutingEvaluator
+	dnsEng           DNSEvaluator
+	coarseNano       atomic.Int64
+	dnsQueue         chan dnsTask
+	mu               sync.Mutex
+	closed           bool
 }
 
 // NewRedirector initializes a new Redirector with given settings.
@@ -161,6 +164,7 @@ func NewRedirector(localListenAddr string, customFilter string) (*Redirector, er
 	r := &Redirector{
 		dll:            dll,
 		handle:         syscall.InvalidHandle,
+		forwardHandle:  syscall.InvalidHandle,
 		filterStr:      filterStr,
 		localProxyPort: port,
 		localProxyIP:   ip,
@@ -169,6 +173,14 @@ func NewRedirector(localListenAddr string, customFilter string) (*Redirector, er
 	}
 	r.coarseNano.Store(time.Now().UnixNano())
 	return r, nil
+}
+
+// SetForwardLayer configures forward layer (Layer 1) filtering to intercept routed/forwarded packets.
+func (r *Redirector) SetForwardLayer(forwardFilter string, enabled bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.forwardFilterStr = forwardFilter
+	r.forwardEnabled = enabled
 }
 
 // SetDryRun configures dry-run audit mode without intercepting traffic.
@@ -212,7 +224,7 @@ func (r *Redirector) Start(ctx context.Context) error {
 
 	handle, err := r.dll.Open(r.filterStr, WINDIVERT_LAYER_NETWORK, 0, flags)
 	if err != nil {
-		return fmt.Errorf("failed to open WinDivert handle: %w", err)
+		return fmt.Errorf("failed to open WinDivert handle (Layer 0): %w", err)
 	}
 	r.handle = handle
 
@@ -221,7 +233,21 @@ func (r *Redirector) Start(ctx context.Context) error {
 	_ = r.dll.SetParam(handle, WINDIVERT_PARAM_QUEUE_TIME, 2000)
 	_ = r.dll.SetParam(handle, WINDIVERT_PARAM_QUEUE_SIZE, 32*1024*1024)
 
-	log.Printf("[Redirector] WinDivert started with filter: %s", r.filterStr)
+	log.Printf("[Redirector] WinDivert Network Layer (Layer 0) started with filter: %s", r.filterStr)
+
+	// Concurrently open Forward Layer (Layer 1) for routed/forwarded traffic (e.g. WSL2/Hyper-V VM)
+	if r.forwardEnabled && r.forwardFilterStr != "" {
+		fwdHandle, fwdErr := r.dll.Open(r.forwardFilterStr, WINDIVERT_LAYER_NETWORK_FORWARD, 0, flags)
+		if fwdErr != nil {
+			log.Printf("[Redirector] WARNING: Failed to open WinDivert Forward Layer (Layer 1): %v. Continuing with Network Layer (Layer 0) only.", fwdErr)
+		} else {
+			r.forwardHandle = fwdHandle
+			_ = r.dll.SetParam(fwdHandle, WINDIVERT_PARAM_QUEUE_LENGTH, 8192)
+			_ = r.dll.SetParam(fwdHandle, WINDIVERT_PARAM_QUEUE_TIME, 2000)
+			_ = r.dll.SetParam(fwdHandle, WINDIVERT_PARAM_QUEUE_SIZE, 32*1024*1024)
+			log.Printf("[Redirector] WinDivert Forward Layer (Layer 1) started with filter: %s", r.forwardFilterStr)
+		}
+	}
 
 	// Start coarse timestamp background ticker (20ms interval) to avoid per-packet time.Now syscalls
 	r.coarseNano.Store(time.Now().UnixNano())
@@ -252,7 +278,16 @@ func (r *Redirector) Start(ctx context.Context) error {
 		numWorkers = 8
 	}
 	for i := 0; i < numWorkers; i++ {
-		go r.packetLoop(ctx, i)
+		go r.packetLoop(ctx, r.handle, i, false)
+	}
+	if r.forwardHandle != syscall.InvalidHandle {
+		fwdWorkers := numWorkers / 2
+		if fwdWorkers < 2 {
+			fwdWorkers = 2
+		}
+		for i := 0; i < fwdWorkers; i++ {
+			go r.packetLoop(ctx, r.forwardHandle, i, true)
+		}
 	}
 
 	// Start NAT session table garbage collection loop
@@ -341,7 +376,7 @@ func (r *Redirector) DeleteSession(clientAddr net.Addr) {
 }
 
 // packetLoop continuously receives, rewrites (Forward & Reverse NAT), and reinjects packets.
-func (r *Redirector) packetLoop(ctx context.Context, workerID int) {
+func (r *Redirector) packetLoop(ctx context.Context, recvHandle syscall.Handle, workerID int, isForwardLayer bool) {
 	// Pin worker goroutine to a dedicated OS thread for zero context-switch overhead on WinDivert syscalls
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
@@ -351,7 +386,7 @@ func (r *Redirector) packetLoop(ctx context.Context, workerID int) {
 		func() {
 			defer func() {
 				if rec := recover(); rec != nil {
-					log.Printf("[Redirector] CRITICAL: Recovered from panic in packetLoop worker %d: %v", workerID, rec)
+					log.Printf("[Redirector] CRITICAL: Recovered from panic in packetLoop worker %d (forward=%v): %v", workerID, isForwardLayer, rec)
 					time.Sleep(1 * time.Second)
 				}
 			}()
@@ -367,7 +402,7 @@ func (r *Redirector) packetLoop(ctx context.Context, workerID int) {
 				default:
 				}
 
-				n, err := r.dll.Recv(r.handle, packetBuf, &addr)
+				n, err := r.dll.Recv(recvHandle, packetBuf, &addr)
 				if err != nil {
 					r.mu.Lock()
 					isClosed := r.closed
@@ -404,12 +439,12 @@ func (r *Redirector) packetLoop(ctx context.Context, workerID int) {
 
 							// DIAGNOSTIC: Detect self-interception of proxy's own outbound connections
 							if srcPort >= 40000 && srcPort <= 48999 {
-								logger.Debugf("[TRAP]  SELF-INTERCEPTION DETECTED! SrcPort=%d is in proxy outbound range! %d.%d.%d.%d:%d -> %d.%d.%d.%d:%d (pktLen=%d, IfIdx=%d, Flags=0x%x, Loopback=%v)",
+								logger.Debugf("[TRAP]  SELF-INTERCEPTION DETECTED! SrcPort=%d is in proxy outbound range! %d.%d.%d.%d:%d -> %d.%d.%d.%d:%d (pktLen=%d, IfIdx=%d, Flags=0x%x, Loopback=%v, Fwd=%v)",
 									srcPort, srcIP[0], srcIP[1], srcIP[2], srcIP[3], srcPort,
 									dstIP[0], dstIP[1], dstIP[2], dstIP[3], dstPort,
-									len(rawPacket), addr.IfIdx, addr.Flags, addr.IsLoopback())
+									len(rawPacket), addr.IfIdx, addr.Flags, addr.IsLoopback(), isForwardLayer)
 								// DO NOT process - just reinject as-is to prevent loop
-								_, _ = r.dll.Send(r.handle, rawPacket, &addr)
+								_, _ = r.dll.Send(recvHandle, rawPacket, &addr)
 								continue
 							}
 
@@ -511,6 +546,11 @@ func (r *Redirector) packetLoop(ctx context.Context, workerID int) {
 								addr.SetOutbound(false) // Inbound to local proxy listener
 								addr.Flags |= WINDIVERT_ADDRESS_FLAG_IMPOSTOR
 								_ = r.dll.CalcChecksums(rawPacket, &addr, 0)
+								_, sendErr := r.dll.Send(r.handle, rawPacket, &addr)
+								if sendErr != nil {
+									logger.Debugf("[NAT] Forward NAT send failed: %v", sendErr)
+								}
+								continue
 							}
 						}
 					} else if proto == IPPROTO_UDP {
@@ -578,11 +618,11 @@ func (r *Redirector) packetLoop(ctx context.Context, workerID int) {
 
 							// DIAGNOSTIC: Detect self-interception of proxy's own outbound connections
 							if srcPort >= 40000 && srcPort <= 48999 {
-								logger.Debugf("[TRAP-v6] SELF-INTERCEPTION DETECTED! SrcPort=%d is in proxy outbound range! [%s]:%d -> [%s]:%d (pktLen=%d, IfIdx=%d, Flags=0x%x, Loopback=%v)",
+								logger.Debugf("[TRAP-v6] SELF-INTERCEPTION DETECTED! SrcPort=%d is in proxy outbound range! [%s]:%d -> [%s]:%d (pktLen=%d, IfIdx=%d, Flags=0x%x, Loopback=%v, Fwd=%v)",
 									srcPort, net.IP(srcIP6[:]), srcPort, net.IP(dstIP6[:]), dstPort,
-									len(rawPacket), addr.IfIdx, addr.Flags, addr.IsLoopback())
+									len(rawPacket), addr.IfIdx, addr.Flags, addr.IsLoopback(), isForwardLayer)
 								// DO NOT process - just reinject as-is to prevent loop
-								_, _ = r.dll.Send(r.handle, rawPacket, &addr)
+								_, _ = r.dll.Send(recvHandle, rawPacket, &addr)
 								continue
 							}
 
@@ -675,6 +715,11 @@ func (r *Redirector) packetLoop(ctx context.Context, workerID int) {
 								addr.SetOutbound(false) // Inbound to local proxy listener
 								addr.Flags |= WINDIVERT_ADDRESS_FLAG_IMPOSTOR
 								_ = r.dll.CalcChecksums(rawPacket, &addr, 0)
+								_, sendErr := r.dll.Send(r.handle, rawPacket, &addr)
+								if sendErr != nil {
+									logger.Debugf("[NAT-v6] Forward NAT send failed: %v", sendErr)
+								}
+								continue
 							}
 						}
 					} else if nextHdr == IPPROTO_UDP {
@@ -721,11 +766,11 @@ func (r *Redirector) packetLoop(ctx context.Context, workerID int) {
 					}
 				}
 
-				// Reinject packet into network stack
-				_, sendErr := r.dll.Send(r.handle, rawPacket, &addr)
+				// Reinject unmodified passthrough packet into network stack via the handle it was received on
+				_, sendErr := r.dll.Send(recvHandle, rawPacket, &addr)
 				if sendErr != nil {
-					log.Printf("[NAT-SEND] Reinjection failed (len=%d, IfIdx=%d, Flags=0x%x, Outbound=%v): %v",
-						len(rawPacket), addr.IfIdx, addr.Flags, addr.IsOutbound(), sendErr)
+					logger.Debugf("[NAT-SEND] Reinjection failed (len=%d, IfIdx=%d, Flags=0x%x, Outbound=%v, Fwd=%v): %v",
+						len(rawPacket), addr.IfIdx, addr.Flags, addr.IsOutbound(), isForwardLayer, sendErr)
 				}
 			}
 		}()
@@ -790,7 +835,7 @@ func (r *Redirector) sessionGCLoop(ctx context.Context) {
 	}
 }
 
-// Close closes the WinDivert handle and frees all resources.
+// Close closes both the Network Layer and Forward Layer WinDivert handles and frees all resources.
 func (r *Redirector) Close() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -800,14 +845,24 @@ func (r *Redirector) Close() error {
 	}
 	r.closed = true
 
-	if r.handle != syscall.InvalidHandle {
-		log.Printf("[Redirector] Closing WinDivert handle and restoring network state...")
-		err := r.dll.Close(r.handle)
-		r.handle = syscall.InvalidHandle
-		return err
+	var lastErr error
+	if r.forwardHandle != syscall.InvalidHandle {
+		log.Printf("[Redirector] Closing WinDivert Forward Layer handle...")
+		if err := r.dll.Close(r.forwardHandle); err != nil {
+			lastErr = err
+		}
+		r.forwardHandle = syscall.InvalidHandle
 	}
 
-	return nil
+	if r.handle != syscall.InvalidHandle {
+		log.Printf("[Redirector] Closing WinDivert Network Layer handle and restoring network state...")
+		if err := r.dll.Close(r.handle); err != nil {
+			lastErr = err
+		}
+		r.handle = syscall.InvalidHandle
+	}
+
+	return lastErr
 }
 
 // handleDryRunTCP inspects and logs an outbound TCP packet for dry-run monitoring.

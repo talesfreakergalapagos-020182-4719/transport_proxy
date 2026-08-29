@@ -192,6 +192,11 @@ func FormatBytes(b int64) string {
 
 // PipeConn copies data bidirectionally between client and upstream connections with half-close support.
 func PipeConn(c1 net.Conn, c2 net.Conn, preBuffered io.Reader, idleTimeout time.Duration) (int64, int64) {
+	return PipeConnEx(c1, c2, nil, preBuffered, idleTimeout)
+}
+
+// PipeConnEx copies data bidirectionally between client and upstream connections, supporting pre-buffered readers on both ends.
+func PipeConnEx(c1 net.Conn, c2 net.Conn, clientPreBuffered io.Reader, upstreamPreBuffered io.Reader, idleTimeout time.Duration) (int64, int64) {
 	OptimizeTCPConn(c1)
 	OptimizeTCPConn(c2)
 
@@ -223,9 +228,9 @@ func PipeConn(c1 net.Conn, c2 net.Conn, preBuffered io.Reader, idleTimeout time.
 		}()
 
 		var src io.Reader = c2
-		if preBuffered != nil {
-			if br, ok := preBuffered.(*bufio.Reader); !ok || br != nil {
-				src = preBuffered
+		if upstreamPreBuffered != nil {
+			if br, ok := upstreamPreBuffered.(*bufio.Reader); !ok || br != nil {
+				src = upstreamPreBuffered
 			}
 		}
 
@@ -298,6 +303,13 @@ func PipeConn(c1 net.Conn, c2 net.Conn, preBuffered io.Reader, idleTimeout time.
 			}
 		}()
 
+		var clientSrc io.Reader = c1
+		if clientPreBuffered != nil {
+			if br, ok := clientPreBuffered.(*bufio.Reader); !ok || br != nil {
+				clientSrc = clientPreBuffered
+			}
+		}
+
 		bufPtr := bufferPool.Get().(*[]byte)
 		defer bufferPool.Put(bufPtr)
 		buf := *bufPtr
@@ -308,7 +320,7 @@ func PipeConn(c1 net.Conn, c2 net.Conn, preBuffered io.Reader, idleTimeout time.
 		}
 
 		for {
-			nr, er := c1.Read(buf)
+			nr, er := clientSrc.Read(buf)
 			if nr > 0 {
 				if idleTimeout > 0 {
 					_ = c1.SetReadDeadline(time.Now().Add(idleTimeout))

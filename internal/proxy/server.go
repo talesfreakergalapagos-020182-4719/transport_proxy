@@ -1,10 +1,12 @@
 package proxy
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -171,10 +173,15 @@ func (s *Server) handleClient(ctx context.Context, clientConn net.Conn) {
 	OptimizeTCPConn(clientConn)
 
 	// 1. Resolve original destination from NAT table
-	origIP, origPort, found := s.redirector.LookupOriginalDestination(clientConn.RemoteAddr())
+	var origIP net.IP
+	var origPort uint16
+	var found bool
+	if s.redirector != nil {
+		origIP, origPort, found = s.redirector.LookupOriginalDestination(clientConn.RemoteAddr())
+	}
 	if !found {
-		// Connection arrived without NAT tracking (e.g. direct curl to local proxy port)
-		log.Printf("[ProxyServer] Unknown original destination for %s (no NAT session)", clientConn.RemoteAddr())
+		// Connection arrived without NAT tracking (explicit forward proxy connection, e.g. curl -x http://127.0.0.1:18080)
+		s.handleExplicitProxyClient(ctx, clientConn)
 		return
 	}
 	logger.Debugf("[DEBUG] Connection accepted: Client %s -> Original Target %s", clientConn.RemoteAddr(), net.JoinHostPort(origIP.String(), strconv.Itoa(int(origPort))))
@@ -313,6 +320,184 @@ func (s *Server) handleClient(ctx context.Context, clientConn net.Conn) {
 	log.Printf("[CLOSE] Client: %-21s | Target: %-30s | Sent: %-8s | Recv: %-8s | Duration: %v",
 		clientConn.RemoteAddr(), targetDisplay,
 		FormatBytes(totalSent), FormatBytes(bytesUpToClient),
+		duration)
+}
+
+// handleExplicitProxyClient handles explicit HTTP and HTTPS CONNECT proxy requests (e.g. from WSL via http_proxy).
+func (s *Server) handleExplicitProxyClient(ctx context.Context, clientConn net.Conn) {
+	cfg := s.cfgMgr.Get()
+	connectTimeout := time.Duration(cfg.ConnectTimeoutSec) * time.Second
+	idleTimeout := time.Duration(cfg.IdleTimeoutSec) * time.Second
+
+	// Set initial read deadline for HTTP request header
+	_ = clientConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	clientReader := bufio.NewReader(clientConn)
+	req, err := http.ReadRequest(clientReader)
+	_ = clientConn.SetReadDeadline(time.Time{})
+
+	if err != nil {
+		logger.Debugf("[ProxyServer] Direct connection from %s failed to parse as HTTP request: %v", clientConn.RemoteAddr(), err)
+		return
+	}
+
+	startTime := time.Now()
+	forwarder := NewForwarder(cfg.BypassSSPI, cfg.ConnectTimeoutSec)
+
+	if req.Method == http.MethodConnect {
+		// ----------------------------------------------------
+		// Explicit HTTPS Proxy Tunnel (CONNECT host:port HTTP/1.1)
+		// ----------------------------------------------------
+		target := req.RequestURI
+		if target == "" {
+			target = req.Host
+		}
+
+		targetHost, portStr, err := net.SplitHostPort(target)
+		var targetPort uint16 = 443
+		if err != nil {
+			targetHost = target
+		} else {
+			if p, pErr := strconv.Atoi(portStr); pErr == nil && p > 0 && p <= 65535 {
+				targetPort = uint16(p)
+			}
+		}
+		targetDisplay := net.JoinHostPort(targetHost, strconv.Itoa(int(targetPort)))
+
+		// 1. Policy check (Whitelist / Blacklist)
+		if s.filterEng.ShouldBlock(targetHost) {
+			log.Printf("[BLOCK] HTTPS (EXPLICIT) | Client: %-21s | Target: %-30s -> Blocked by policy",
+				clientConn.RemoteAddr(), targetDisplay)
+			_, _ = clientConn.Write([]byte("HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nBlocked by policy\n"))
+			return
+		}
+
+		// 2. Resolve proxy decision via PAC / static configuration
+		decision, err := s.pacResolver.Resolve(targetHost, targetPort)
+		if err != nil {
+			logger.Debugf("[ProxyServer] Routing resolution error for %s: %v", targetHost, err)
+			decision = pac.ProxyDecision{IsDirect: true}
+		}
+
+		proxyToUse := ""
+		if !decision.IsDirect && decision.ProxyURL != "" {
+			proxyToUse = decision.ProxyURL
+			log.Printf("[ALLOW] HTTPS (EXPLICIT) | Client: %-21s | Target: %-30s -> PROXY (%s)",
+				clientConn.RemoteAddr(), targetDisplay, proxyToUse)
+		} else {
+			log.Printf("[ALLOW] HTTPS (EXPLICIT) | Client: %-21s | Target: %-30s -> DIRECT",
+				clientConn.RemoteAddr(), targetDisplay)
+		}
+
+		// 3. Dial upstream
+		outConn, preBufferedUpstream, dialErr := forwarder.DialOutbound(targetDisplay, proxyToUse)
+		if dialErr != nil {
+			log.Printf("[ERROR] Outbound dial failed for explicit target %s (Proxy: %q): %v", targetDisplay, proxyToUse, dialErr)
+			_, _ = clientConn.Write([]byte(fmt.Sprintf("HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nDial failed: %v\n", dialErr)))
+			return
+		}
+		defer func() {
+			_ = outConn.Close()
+		}()
+
+		// 4. Send 200 Connection Established to client
+		_, writeErr := clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+		if writeErr != nil {
+			logger.Debugf("[ProxyServer] Failed to send 200 Connection Established to %s: %v", clientConn.RemoteAddr(), writeErr)
+			return
+		}
+
+		// 5. Bidirectional forwarding pipe
+		connIdleTimeout := idleTimeout
+		if cfg.IdleTimeoutSec <= 0 || isInteractiveService("HTTPS", targetPort, targetHost) {
+			connIdleTimeout = 0
+		}
+		bytesClientToUp, bytesUpToClient := PipeConnEx(clientConn, outConn, clientReader, preBufferedUpstream, connIdleTimeout)
+		duration := time.Since(startTime).Round(time.Millisecond)
+
+		log.Printf("[CLOSE] Client: %-21s | Target: %-30s | Sent: %-8s | Recv: %-8s | Duration: %v",
+			clientConn.RemoteAddr(), targetDisplay,
+			FormatBytes(bytesClientToUp), FormatBytes(bytesUpToClient),
+			duration)
+		return
+	}
+
+	// ----------------------------------------------------
+	// Explicit HTTP Forward Proxy (GET/POST/etc http://host/path HTTP/1.1)
+	// ----------------------------------------------------
+	targetHost := req.URL.Hostname()
+	if targetHost == "" {
+		targetHost = req.Host
+		if h, _, err := net.SplitHostPort(targetHost); err == nil {
+			targetHost = h
+		}
+	}
+	portStr := req.URL.Port()
+	var targetPort uint16 = 80
+	if portStr != "" {
+		if p, pErr := strconv.Atoi(portStr); pErr == nil && p > 0 && p <= 65535 {
+			targetPort = uint16(p)
+		}
+	}
+	targetDisplay := net.JoinHostPort(targetHost, strconv.Itoa(int(targetPort)))
+
+	// 1. Policy check
+	if s.filterEng.ShouldBlock(targetHost) {
+		log.Printf("[BLOCK] HTTP (EXPLICIT)  | Client: %-21s | Target: %-30s -> Blocked by policy",
+			clientConn.RemoteAddr(), targetDisplay)
+		_, _ = clientConn.Write([]byte("HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nBlocked by policy\n"))
+		return
+	}
+
+	// 2. Resolve proxy decision
+	decision, err := s.pacResolver.Resolve(targetHost, targetPort)
+	if err != nil {
+		decision = pac.ProxyDecision{IsDirect: true}
+	}
+
+	proxyToUse := ""
+	if !decision.IsDirect && decision.ProxyURL != "" {
+		proxyToUse = decision.ProxyURL
+		log.Printf("[ALLOW] HTTP (EXPLICIT)  | Client: %-21s | Target: %-30s -> PROXY (%s)",
+			clientConn.RemoteAddr(), targetDisplay, proxyToUse)
+	} else {
+		log.Printf("[ALLOW] HTTP (EXPLICIT)  | Client: %-21s | Target: %-30s -> DIRECT",
+			clientConn.RemoteAddr(), targetDisplay)
+	}
+
+	// 3. Dial upstream
+	outConn, preBufferedUpstream, dialErr := forwarder.DialOutbound(targetDisplay, proxyToUse)
+	if dialErr != nil {
+		log.Printf("[ERROR] Outbound dial failed for explicit target %s (Proxy: %q): %v", targetDisplay, proxyToUse, dialErr)
+		_, _ = clientConn.Write([]byte(fmt.Sprintf("HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nDial failed: %v\n", dialErr)))
+		return
+	}
+	defer func() {
+		_ = outConn.Close()
+	}()
+
+	// 4. Forward the initial HTTP request to upstream
+	if proxyToUse == "" {
+		req.RequestURI = ""
+		req.Header.Del("Proxy-Connection")
+	}
+	_ = outConn.SetWriteDeadline(time.Now().Add(connectTimeout))
+	if err := req.Write(outConn); err != nil {
+		log.Printf("[ERROR] Failed to write HTTP request to upstream %s: %v", targetDisplay, err)
+		return
+	}
+	_ = outConn.SetWriteDeadline(time.Time{})
+
+	// 5. Pipe remaining connection
+	connIdleTimeout := idleTimeout
+	if cfg.IdleTimeoutSec <= 0 {
+		connIdleTimeout = 0
+	}
+	bytesClientToUp, bytesUpToClient := PipeConnEx(clientConn, outConn, clientReader, preBufferedUpstream, connIdleTimeout)
+	duration := time.Since(startTime).Round(time.Millisecond)
+
+	log.Printf("[CLOSE] Client: %-21s | Target: %-30s | Sent: %-8s | Recv: %-8s | Duration: %v",
+		clientConn.RemoteAddr(), targetDisplay,
+		FormatBytes(bytesClientToUp), FormatBytes(bytesUpToClient),
 		duration)
 }
 

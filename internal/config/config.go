@@ -38,6 +38,7 @@ type Config struct {
 	FallbackToUDP     bool     `json:"fallback_to_udp"`     // If true, fallback to standard UDP 53 DNS on DoH failure/unsupported (default: true)
 	DNSCacheEnabled   bool     `json:"dns_cache_enabled"`   // If true, enable in-memory caching of DNS answers (default: true)
 	DNSCacheTTLSec    int      `json:"dns_cache_ttl_sec"`   // Max TTL in seconds for DNS answer cache (default: 300)
+	ForwardLayerEnabled bool     `json:"forward_layer_enabled"` // If true, concurrently capture forwarded/routed traffic via WINDIVERT_LAYER_NETWORK_FORWARD (default: true)
 }
 
 // BuildDivertFilter generates a complete WinDivert filter string capturing ALL TCP outbound traffic,
@@ -66,6 +67,18 @@ func (c *Config) BuildDivertFilter(localProxyPort uint16) (forwardCond string, f
 	return forwardCond, fullFilter
 }
 
+// BuildForwardDivertFilter generates a WinDivert filter string for WINDIVERT_LAYER_NETWORK_FORWARD (Layer 1).
+// Layer 1 intercepts packets routed/forwarded between interfaces (e.g. from WSL/Hyper-V VM to physical adapter).
+// It does not use 'outbound' or '!loopback' since those apply to Layer 0.
+func (c *Config) BuildForwardDivertFilter(localProxyPort uint16) string {
+	dohFilter := ""
+	if c.DohEnabled {
+		dohFilter = " or (udp and udp.DstPort == 53)"
+	}
+	return fmt.Sprintf("((tcp and tcp.DstPort != %d and (tcp.SrcPort < %d or tcp.SrcPort > %d)) or (udp and udp.DstPort == 443)%s)",
+		localProxyPort, OutboundPortMin, OutboundPortMax, dohFilter)
+}
+
 // DefaultConfig returns a Config with safe default settings.
 func DefaultConfig() *Config {
 	return &Config{
@@ -86,8 +99,9 @@ func DefaultConfig() *Config {
 		DohEnabled:        true,
 		DohTimeoutSec:     3,
 		FallbackToUDP:     true,
-		DNSCacheEnabled:   true,
-		DNSCacheTTLSec:    300,
+		DNSCacheEnabled:     true,
+		DNSCacheTTLSec:      300,
+		ForwardLayerEnabled: true,
 	}
 }
 

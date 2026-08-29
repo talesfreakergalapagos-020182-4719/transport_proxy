@@ -1,5 +1,6 @@
 {
   "doh_enabled": true,
+  "forward_layer_enabled": true,
   "log_file": "",
   "pac_url": "http://proxy.corp.local/proxy.pac",
   "upstream_proxy": "",

@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -573,5 +574,137 @@ func TestServer_AcquireListener_Fallback(t *testing.T) {
 	}
 
 	t.Logf("AcquireListener fallback test passed: Preferred 18190 was occupied, successfully acquired %d", acquiredPort)
+}
+
+func TestIntegration_ExplicitProxyCONNECTAndHTTP(t *testing.T) {
+	// 1. Setup mock destination web server
+	targetContent := "EXPLICIT PROXY TEST SUCCESS"
+	targetServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, targetContent)
+	}))
+	defer targetServer.Close()
+
+	targetHostPort := strings.TrimPrefix(targetServer.URL, "http://")
+	targetHost, _, _ := net.SplitHostPort(targetHostPort)
+
+	// 2. Setup config & Server (Allow mode)
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "config.json")
+	cfgContent := `{"filter_mode":"whitelist","allowed_domains":["` + targetHost + `"],"allowed_ips":["` + targetHost + `"]}`
+	_ = os.WriteFile(cfgPath, []byte(cfgContent), 0644)
+
+	cfgMgr, err := config.NewManager(cfgPath)
+	if err != nil {
+		t.Fatalf("NewManager failed: %v", err)
+	}
+	defer cfgMgr.Stop()
+
+	filterEng := filter.NewEngine("whitelist", []string{targetHost}, []string{targetHost})
+	pacResolver, err := pac.NewResolver("", "")
+	if err != nil {
+		t.Fatalf("NewResolver failed: %v", err)
+	}
+	defer pacResolver.Close()
+
+	server := NewServer(cfgMgr, filterEng, nil, pacResolver)
+	defer server.Close()
+
+	proxyLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to listen on ephemeral port: %v", err)
+	}
+	defer proxyLn.Close()
+	proxyAddr := proxyLn.Addr().String()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_ = server.StartWithListener(ctx, proxyLn)
+
+	// Test A: Explicit HTTPS CONNECT Tunnel
+	t.Run("CONNECT_Allowed", func(t *testing.T) {
+		conn, err := net.Dial("tcp", proxyAddr)
+		if err != nil {
+			t.Fatalf("Failed to connect to proxy: %v", err)
+		}
+		defer conn.Close()
+
+		// Send CONNECT request
+		connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", targetHostPort, targetHostPort)
+		if _, err := conn.Write([]byte(connectReq)); err != nil {
+			t.Fatalf("Failed to write CONNECT: %v", err)
+		}
+
+		// Read response: expect 200 Connection Established
+		br := bufio.NewReader(conn)
+		resp, err := http.ReadResponse(br, &http.Request{Method: "CONNECT"})
+		if err != nil {
+			t.Fatalf("Failed to read CONNECT response: %v", err)
+		}
+		if resp.StatusCode != 200 {
+			t.Fatalf("Expected 200, got %d", resp.StatusCode)
+		}
+
+		// Now send HTTP GET over established tunnel
+		httpReq := fmt.Sprintf("GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", targetHostPort)
+		if _, err := conn.Write([]byte(httpReq)); err != nil {
+			t.Fatalf("Failed to send HTTP GET over tunnel: %v", err)
+		}
+
+		httpResp, err := http.ReadResponse(br, &http.Request{Method: "GET"})
+		if err != nil {
+			t.Fatalf("Failed to read HTTP response over tunnel: %v", err)
+		}
+		body, _ := io.ReadAll(httpResp.Body)
+		if string(body) != targetContent {
+			t.Errorf("Expected body %q, got %q", targetContent, string(body))
+		}
+	})
+
+	// Test B: Explicit HTTP Forward Proxy (GET http://host:port/)
+	t.Run("HTTP_Get_Allowed", func(t *testing.T) {
+		conn, err := net.Dial("tcp", proxyAddr)
+		if err != nil {
+			t.Fatalf("Failed to connect to proxy: %v", err)
+		}
+		defer conn.Close()
+
+		httpReq := fmt.Sprintf("GET http://%s/ HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", targetHostPort, targetHostPort)
+		if _, err := conn.Write([]byte(httpReq)); err != nil {
+			t.Fatalf("Failed to write HTTP GET: %v", err)
+		}
+
+		br := bufio.NewReader(conn)
+		httpResp, err := http.ReadResponse(br, &http.Request{Method: "GET"})
+		if err != nil {
+			t.Fatalf("Failed to read HTTP response: %v", err)
+		}
+		body, _ := io.ReadAll(httpResp.Body)
+		if string(body) != targetContent {
+			t.Errorf("Expected body %q, got %q", targetContent, string(body))
+		}
+	})
+
+	// Test C: Explicit CONNECT Blocked by policy
+	t.Run("CONNECT_Blocked", func(t *testing.T) {
+		conn, err := net.Dial("tcp", proxyAddr)
+		if err != nil {
+			t.Fatalf("Failed to connect to proxy: %v", err)
+		}
+		defer conn.Close()
+
+		connectReq := "CONNECT blocked-domain.com:443 HTTP/1.1\r\nHost: blocked-domain.com:443\r\n\r\n"
+		if _, err := conn.Write([]byte(connectReq)); err != nil {
+			t.Fatalf("Failed to write CONNECT: %v", err)
+		}
+
+		br := bufio.NewReader(conn)
+		resp, err := http.ReadResponse(br, &http.Request{Method: "CONNECT"})
+		if err != nil {
+			t.Fatalf("Failed to read response: %v", err)
+		}
+		if resp.StatusCode != 403 {
+			t.Errorf("Expected 403 Forbidden, got %d", resp.StatusCode)
+		}
+	})
 }
 
