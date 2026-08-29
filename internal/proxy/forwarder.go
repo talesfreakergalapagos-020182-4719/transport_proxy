@@ -215,6 +215,9 @@ func PipeConnEx(c1 net.Conn, c2 net.Conn, clientPreBuffered io.Reader, upstreamP
 		deadlineRefreshInterval = 5 * time.Second
 	}
 
+	c1AddrStr := c1.RemoteAddr().String()
+	c2AddrStr := c2.RemoteAddr().String()
+
 	// 1. Upstream -> Client (c2 -> c1)
 	go func() {
 		var localBytes int64
@@ -226,7 +229,7 @@ func PipeConnEx(c1 net.Conn, c2 net.Conn, clientPreBuffered io.Reader, upstreamP
 		}()
 		defer func() {
 			if r := recover(); r != nil {
-				logger.Debugf("[PIPE-DOWN] Panic recovered: %v", r)
+				if logger.IsVerbose() { logger.Debugf("[PIPE-DOWN] Panic recovered: %v", r) }
 			}
 		}()
 
@@ -241,45 +244,52 @@ func PipeConnEx(c1 net.Conn, c2 net.Conn, clientPreBuffered io.Reader, upstreamP
 		defer bufferPool.Put(bufPtr)
 		buf := *bufPtr
 
-		logger.Debugf("[PIPE-DOWN] Started: Upstream (%s) -> Client (%s)", c2.RemoteAddr(), c1.RemoteAddr())
+		if logger.IsVerbose() { logger.Debugf("[PIPE-DOWN] Started: Upstream (%s) -> Client (%s)", c2AddrStr, c1AddrStr) }
 		firstRead := true
-		if idleTimeout > 0 {
-			_ = c2.SetReadDeadline(time.Now().Add(idleTimeout))
+		
+		var lastDeadline time.Time
+		updateDeadline := func() {
+			if idleTimeout > 0 {
+				now := time.Now()
+				if now.Sub(lastDeadline) > deadlineRefreshInterval {
+					_ = c2.SetReadDeadline(now.Add(idleTimeout))
+					lastDeadline = now
+				}
+			}
 		}
+		updateDeadline()
 
 		for {
 			if firstRead {
-				logger.Debugf("[PIPE-DOWN] Waiting for first byte from upstream %s...", c2.RemoteAddr())
+				if logger.IsVerbose() { logger.Debugf("[PIPE-DOWN] Waiting for first byte from upstream %s...", c2AddrStr) }
 			}
 			nr, er := src.Read(buf)
 			if firstRead {
-				logger.Debugf("[PIPE-DOWN] First read result from upstream %s: read=%d bytes, err=%v", c2.RemoteAddr(), nr, er)
+				if logger.IsVerbose() { logger.Debugf("[PIPE-DOWN] First read result from upstream %s: read=%d bytes, err=%v", c2AddrStr, nr, er) }
 				firstRead = false
 			}
 			if nr > 0 {
-				if idleTimeout > 0 {
-					_ = c2.SetReadDeadline(time.Now().Add(idleTimeout))
-				}
-				logger.Debugf("[PIPE-DOWN] Received %d bytes from upstream %s -> Writing to client %s", nr, c2.RemoteAddr(), c1.RemoteAddr())
+				updateDeadline()
+				if logger.IsVerbose() { logger.Debugf("[PIPE-DOWN] Received %d bytes from upstream %s -> Writing to client %s", nr, c2AddrStr, c1AddrStr) }
 				nw, ew := c1.Write(buf[0:nr])
 				if nw > 0 {
 					localBytes += int64(nw)
 				}
 				if ew != nil {
-					logger.Debugf("[PIPE-DOWN] Write to client %s failed: %v", c1.RemoteAddr(), ew)
+					if logger.IsVerbose() { logger.Debugf("[PIPE-DOWN] Write to client %s failed: %v", c1AddrStr, ew) }
 					_ = c1.Close()
 					_ = c2.Close()
 					return
 				}
 				if nr != nw {
-					logger.Debugf("[PIPE-DOWN] Short write to client: read=%d, wrote=%d", nr, nw)
+					if logger.IsVerbose() { logger.Debugf("[PIPE-DOWN] Short write to client: read=%d, wrote=%d", nr, nw) }
 					_ = c1.Close()
 					_ = c2.Close()
 					return
 				}
 			}
 			if er != nil {
-				logger.Debugf("[PIPE-DOWN] Upstream read ended (c2=%s): %v", c2.RemoteAddr(), er)
+				if logger.IsVerbose() { logger.Debugf("[PIPE-DOWN] Upstream read ended (c2=%s): %v", c2AddrStr, er) }
 				if er == io.EOF {
 					closeWrite(c1)
 				} else {
@@ -302,7 +312,7 @@ func PipeConnEx(c1 net.Conn, c2 net.Conn, clientPreBuffered io.Reader, upstreamP
 		}()
 		defer func() {
 			if r := recover(); r != nil {
-				logger.Debugf("[PIPE-UP] Panic recovered: %v", r)
+				if logger.IsVerbose() { logger.Debugf("[PIPE-UP] Panic recovered: %v", r) }
 			}
 		}()
 
@@ -317,37 +327,44 @@ func PipeConnEx(c1 net.Conn, c2 net.Conn, clientPreBuffered io.Reader, upstreamP
 		defer bufferPool.Put(bufPtr)
 		buf := *bufPtr
 
-		logger.Debugf("[PIPE-UP] Started: Client (%s) -> Upstream (%s)", c1.RemoteAddr(), c2.RemoteAddr())
-		if idleTimeout > 0 {
-			_ = c1.SetReadDeadline(time.Now().Add(idleTimeout))
+		if logger.IsVerbose() { logger.Debugf("[PIPE-UP] Started: Client (%s) -> Upstream (%s)", c1AddrStr, c2AddrStr) }
+		
+		var lastDeadline time.Time
+		updateDeadline := func() {
+			if idleTimeout > 0 {
+				now := time.Now()
+				if now.Sub(lastDeadline) > deadlineRefreshInterval {
+					_ = c1.SetReadDeadline(now.Add(idleTimeout))
+					lastDeadline = now
+				}
+			}
 		}
+		updateDeadline()
 
 		for {
 			nr, er := clientSrc.Read(buf)
 			if nr > 0 {
-				if idleTimeout > 0 {
-					_ = c1.SetReadDeadline(time.Now().Add(idleTimeout))
-				}
-				logger.Debugf("[PIPE-UP] Received %d bytes from client %s -> Forwarding to upstream %s", nr, c1.RemoteAddr(), c2.RemoteAddr())
+				updateDeadline()
+				if logger.IsVerbose() { logger.Debugf("[PIPE-UP] Received %d bytes from client %s -> Forwarding to upstream %s", nr, c1AddrStr, c2AddrStr) }
 				nw, ew := c2.Write(buf[0:nr])
 				if nw > 0 {
 					localBytes += int64(nw)
 				}
 				if ew != nil {
-					logger.Debugf("[PIPE-UP] Write to upstream %s failed: %v", c2.RemoteAddr(), ew)
+					if logger.IsVerbose() { logger.Debugf("[PIPE-UP] Write to upstream %s failed: %v", c2AddrStr, ew) }
 					_ = c1.Close()
 					_ = c2.Close()
 					return
 				}
 				if nr != nw {
-					logger.Debugf("[PIPE-UP] Short write to upstream: read=%d, wrote=%d", nr, nw)
+					if logger.IsVerbose() { logger.Debugf("[PIPE-UP] Short write to upstream: read=%d, wrote=%d", nr, nw) }
 					_ = c1.Close()
 					_ = c2.Close()
 					return
 				}
 			}
 			if er != nil {
-				logger.Debugf("[PIPE-UP] Client read ended (c1=%s): %v", c1.RemoteAddr(), er)
+				if logger.IsVerbose() { logger.Debugf("[PIPE-UP] Client read ended (c1=%s): %v", c1AddrStr, er) }
 				if er == io.EOF {
 					closeWrite(c2)
 				} else {
@@ -362,8 +379,10 @@ func PipeConnEx(c1 net.Conn, c2 net.Conn, clientPreBuffered io.Reader, upstreamP
 	wg.Wait()
 	_ = c1.Close()
 	_ = c2.Close()
-	logger.Debugf("[PIPE] PipeConn finished for Client: %s <-> Upstream: %s (Client->Up: %d B, Up->Client: %d B)",
-		c1.RemoteAddr(), c2.RemoteAddr(), stats.BytesClientToUpstream.Load(), stats.BytesUpstreamToClient.Load())
+	if logger.IsVerbose() {
+		logger.Debugf("[PIPE] PipeConn finished for Client: %s <-> Upstream: %s (Client->Up: %d B, Up->Client: %d B)",
+			c1AddrStr, c2AddrStr, stats.BytesClientToUpstream.Load(), stats.BytesUpstreamToClient.Load())
+	}
 
 	return stats.BytesClientToUpstream.Load(), stats.BytesUpstreamToClient.Load()
 }

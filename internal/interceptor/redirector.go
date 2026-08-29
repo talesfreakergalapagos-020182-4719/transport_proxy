@@ -528,7 +528,6 @@ func (r *Redirector) packetLoop(ctx context.Context, workerID int) {
 								}
 							} else if dstPort == 53 && r.dnsEng != nil && !r.dryRun {
 								// UDP 53 DNS Interception & Worker Pool Queue
-								payload := rawPacket[dataOffset:]
 								clientAddr := &net.UDPAddr{
 									IP:   net.IPv4(srcIP[0], srcIP[1], srcIP[2], srcIP[3]),
 									Port: int(srcPort),
@@ -536,7 +535,7 @@ func (r *Redirector) packetLoop(ctx context.Context, workerID int) {
 								targetIP := net.IPv4(dstIP[0], dstIP[1], dstIP[2], dstIP[3])
 
 								rawCopy := append([]byte(nil), rawPacket...)
-								payloadCopy := append([]byte(nil), payload...)
+								payloadCopy := rawCopy[dataOffset:]
 
 								task := dnsTask{
 									clientAddr: clientAddr,
@@ -697,7 +696,6 @@ func (r *Redirector) packetLoop(ctx context.Context, workerID int) {
 								}
 							} else if dstPort == 53 && r.dnsEng != nil && !r.dryRun {
 								// IPv6 UDP 53 DNS Interception
-								payload := rawPacket[dataOffset:]
 								clientAddr := &net.UDPAddr{
 									IP:   net.IP(srcIP6[:]),
 									Port: int(srcPort),
@@ -705,7 +703,7 @@ func (r *Redirector) packetLoop(ctx context.Context, workerID int) {
 								targetIP := net.IP(dstIP6[:])
 
 								rawCopy := append([]byte(nil), rawPacket...)
-								payloadCopy := append([]byte(nil), payload...)
+								payloadCopy := rawCopy[dataOffset:]
 								origAddr := addr
 
 								task := dnsTask{

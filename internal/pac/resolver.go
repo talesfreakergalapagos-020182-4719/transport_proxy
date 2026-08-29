@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -29,6 +30,7 @@ type Resolver struct {
 	session     *WinHTTPSession
 	mu          sync.RWMutex
 	cache       sync.Map // map[string]*cachedEntry (lock-free concurrent cache)
+	cacheSize   atomic.Int32
 	stopChan    chan struct{}
 }
 
@@ -143,6 +145,7 @@ func (r *Resolver) UpdateConfig(pacURL string, staticProxy string) {
 		r.cache.Delete(key)
 		return true
 	})
+	r.cacheSize.Store(0)
 
 	if r.isPACMode {
 		if r.session == nil {
@@ -219,7 +222,7 @@ func (r *Resolver) Resolve(targetHost string, targetPort uint16) (ProxyDecision,
 		if staticProxy != "" {
 			fallbackDecision = ProxyDecision{IsDirect: false, ProxyURL: normalizeProxyURL(staticProxy)}
 		}
-		r.cache.Store(targetURL, &cachedEntry{
+		r.storeCache(targetURL, &cachedEntry{
 			decision:  fallbackDecision,
 			expiresAt: now.Add(1 * time.Minute),
 		})
@@ -240,7 +243,7 @@ func (r *Resolver) Resolve(targetHost string, targetPort uint16) (ProxyDecision,
 	}
 
 	// Store in cache
-	r.cache.Store(targetURL, &cachedEntry{
+	r.storeCache(targetURL, &cachedEntry{
 		decision:  decision,
 		expiresAt: now.Add(cacheTTL),
 	})
@@ -274,6 +277,7 @@ func (r *Resolver) cacheCleanupLoop() {
 				entry := v.(*cachedEntry)
 				if now.After(entry.expiresAt) {
 					r.cache.Delete(k)
+					r.cacheSize.Add(-1)
 				}
 				return true
 			})
@@ -324,4 +328,23 @@ func normalizeProxyURL(p string) string {
 		return "http://" + p
 	}
 	return u.String()
+}
+
+func (r *Resolver) storeCache(targetURL string, entry *cachedEntry) {
+	if _, loaded := r.cache.LoadOrStore(targetURL, entry); !loaded {
+		if r.cacheSize.Add(1) > maxCacheEntries {
+			// Memory bound reached: proactively clear the cache to prevent unbounded growth
+			r.cache.Range(func(k, v any) bool {
+				r.cache.Delete(k)
+				return true
+			})
+			r.cacheSize.Store(0)
+			// Re-store the current item
+			r.cache.Store(targetURL, entry)
+			r.cacheSize.Add(1)
+		}
+	} else {
+		// Just update the existing entry
+		r.cache.Store(targetURL, entry)
+	}
 }
