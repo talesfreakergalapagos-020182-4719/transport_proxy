@@ -1,3 +1,5 @@
+//go:build windows
+
 package interceptor
 
 import (
@@ -8,8 +10,6 @@ import (
 )
 
 var (
-	ErrPacketTooShort        = errors.New("packet is too short")
-	ErrInvalidHeaderLength   = errors.New("invalid header length")
 	ErrWinDivertNotAvailable = errors.New("WinDivert.dll could not be loaded. Please ensure WinDivert.dll and WinDivert64.sys are placed in the same directory or system PATH")
 )
 

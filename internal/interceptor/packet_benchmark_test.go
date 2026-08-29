@@ -2,6 +2,7 @@ package interceptor
 
 import (
 	"net"
+	"sync"
 	"testing"
 )
 
@@ -34,11 +35,11 @@ func BenchmarkParseTCPFast(b *testing.B) {
 }
 
 func BenchmarkSessionKeyLookup(b *testing.B) {
-	r := &Redirector{}
+	var sessions sync.Map
 	srcIP := [4]byte{192, 168, 1, 50}
 	dstIP := net.ParseIP("93.184.216.34")
 	key := MakeSessionKeyIPv4(srcIP, 54321)
-	r.sessions.Store(key, &SessionInfo{
+	sessions.Store(key, &SessionInfo{
 		OriginalDstIP:   dstIP,
 		OriginalDstPort: 443,
 	})
@@ -47,7 +48,7 @@ func BenchmarkSessionKeyLookup(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		k := MakeSessionKeyIPv4(srcIP, 54321)
-		_, _ = r.sessions.Load(k)
+		_, _ = sessions.Load(k)
 	}
 }
 

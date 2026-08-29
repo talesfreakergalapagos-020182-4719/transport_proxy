@@ -27,7 +27,7 @@ type Resolver struct {
 	pacURL      string
 	staticProxy string
 	isPACMode   bool
-	session     *WinHTTPSession
+	session     pacSession
 	mu          sync.RWMutex
 	cache       sync.Map // map[string]*cachedEntry (lock-free concurrent cache)
 	cacheSize   atomic.Int32
@@ -56,7 +56,7 @@ func NewResolver(pacURL string, staticProxy string) (*Resolver, error) {
 		}
 	}
 
-	// If no explicit PAC/proxy configured in config.json, auto-detect Windows OS proxy settings
+	// If no explicit PAC/proxy configured in config.json, auto-detect OS proxy settings
 	if r.pacURL == "" && r.staticProxy == "" {
 		r.applyOSProxyConfig()
 	} else if r.pacURL != "" {
@@ -64,15 +64,15 @@ func NewResolver(pacURL string, staticProxy string) (*Resolver, error) {
 	}
 
 	if r.isPACMode {
-		session, err := NewWinHTTPSession("tproxy-pac/1.0")
+		session, err := createPACSession("tproxy-pac/1.0")
 		if err != nil {
-			return nil, fmt.Errorf("failed to initialize WinHTTP session for PAC: %w", err)
+			return nil, fmt.Errorf("failed to initialize PAC session: %w", err)
 		}
 		r.session = session
 		if r.pacURL != "" {
 			log.Printf("[PAC] Initialized PAC resolver with URL: %s", r.pacURL)
 		} else {
-			log.Printf("[PAC] Initialized WinHTTP WPAD auto-detect mode")
+			log.Printf("[PAC] Initialized PAC WPAD auto-detect mode")
 		}
 	} else if r.staticProxy != "" {
 		log.Printf("[Proxy] Initialized static upstream proxy: %s", r.staticProxy)
@@ -85,33 +85,21 @@ func NewResolver(pacURL string, staticProxy string) (*Resolver, error) {
 	return r, nil
 }
 
-// applyOSProxyConfig attempts to detect proxy / PAC settings from Windows Internet Options.
+// applyOSProxyConfig attempts to detect proxy / PAC settings from the host operating system.
 func (r *Resolver) applyOSProxyConfig() {
-	ieCfg, err := GetIEProxyConfigForCurrentUser()
-	if err != nil {
+	cfg, err := detectOSProxy()
+	if err != nil || cfg == nil {
 		return
 	}
 
-	if ieCfg.AutoConfigURL != "" {
-		r.pacURL = ieCfg.AutoConfigURL
+	if cfg.AutoConfigURL != "" {
+		r.pacURL = cfg.AutoConfigURL
 		r.isPACMode = true
-		log.Printf("[PAC] Auto-detected Windows PAC script: %s", r.pacURL)
-	} else if ieCfg.Proxy != "" {
-		r.staticProxy = ieCfg.Proxy
+		log.Printf("[PAC] Auto-detected OS PAC script: %s", r.pacURL)
+	} else if cfg.Proxy != "" {
+		r.staticProxy = cfg.Proxy
 		r.isPACMode = false
-		log.Printf("[Proxy] Auto-detected Windows Proxy: %s", r.staticProxy)
-	} else if ieCfg.AutoDetect {
-		log.Printf("[PAC] Auto-detecting WPAD PAC script via DHCP/DNS...")
-		wpadURL, err := DetectAutoProxyConfigURL()
-		if err == nil && wpadURL != "" {
-			r.pacURL = wpadURL
-			r.isPACMode = true
-			log.Printf("[PAC] Auto-detected WPAD PAC script: %s", r.pacURL)
-		} else {
-			r.isPACMode = false
-			r.pacURL = ""
-			log.Printf("[PAC] WPAD auto-detection: No WPAD PAC script found on local network. Defaulting to DIRECT mode.")
-		}
+		log.Printf("[Proxy] Auto-detected OS Proxy: %s", r.staticProxy)
 	}
 }
 
@@ -149,7 +137,7 @@ func (r *Resolver) UpdateConfig(pacURL string, staticProxy string) {
 
 	if r.isPACMode {
 		if r.session == nil {
-			session, err := NewWinHTTPSession("tproxy-pac/1.0")
+			session, err := createPACSession("tproxy-pac/1.0")
 			if err == nil {
 				r.session = session
 			}
@@ -157,7 +145,7 @@ func (r *Resolver) UpdateConfig(pacURL string, staticProxy string) {
 		if r.pacURL != "" {
 			log.Printf("[PAC] Updated PAC URL to: %s", r.pacURL)
 		} else {
-			log.Printf("[PAC] Updated to WinHTTP WPAD auto-detect mode")
+			log.Printf("[PAC] Updated to PAC WPAD auto-detect mode")
 		}
 	} else {
 		if r.session != nil {

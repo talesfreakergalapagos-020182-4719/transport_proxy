@@ -1,21 +1,22 @@
-# Windows Transparent & Forward Proxy Gateway (tproxy)
+# Cross-Platform Transparent & Forward Proxy Gateway (tproxy)
 
-> ### 🌐 Windows は設定ゼロの完全透過制御。WSL は簡単プロキシ設定で一括制御。
-> **ブラウザ・CLI・SSH・RDP、そして WSL（Linux）まで——PC 上の全通信を安全に制御・監査・中継する多機能プロキシゲートウェイ。**
+> ### 🌐 Windows & Ubuntu (Linux) 両対応。設定ゼロの完全透過制御 ＆ ハイブリッドプロキシ。
+> **ブラウザ・CLI (curl/apt)・SSH・RDP・Docker、そして WSL まで——PC 上の全通信を安全に制御・監査・中継する多機能プロキシゲートウェイ。**
 
 ---
 
-## 💡 本ツールの設計コンセプト（ハイブリッドプロキシへの進化）
+## 💡 本ツールの設計コンセプト（ハイブリッドプロキシ）
 
-`tproxy` は元々、OS やアプリにプロキシ設定を一切行わずに通信を横取りする「完全透過プロキシ」として誕生しました。  
-しかし、社内 NTLM/SSO 認証、PAC スクリプト自動解決、DNS-over-HTTPS (DoH)、L7 プロトコル自動識別、RDP/SSH 常時接続維持、そして **WSL2（Windows Subsystem for Linux）の通信制御** といった実用上の要件を取り込む中で、**「透過型プロキシ」と「明示的フォワードプロキシ（HTTP CONNECT）」が完全共存する多機能プロキシゲートウェイ** へと進化しました。
+`tproxy` は、OS やアプリにプロキシ設定を一切行わずに通信を横取りする「完全透過プロキシ」および「明示的フォワードプロキシ（HTTP CONNECT）」が完全共存する多機能プロキシゲートウェイです。  
+同一の `config.json` で **Windows および Ubuntu (Linux) ネイティブ環境の両方** を 100% 同一のポリシーで制御できます。
 
-### 📌 Windows と WSL2 の制御方式の違い
+### 📌 プラットフォーム別の制御方式
 
 | 対象環境 | 制御方式 | 設定方法 | 動作の仕組み |
 | :--- | :--- | :--- | :--- |
-| **Windows ホスト側**<br>(ブラウザ、SSH、RDP、CLI等) | **完全透過プロキシ**<br>(Transparent) | **設定一切不要**<br>(OS/アプリ設定 0) | WinDivert によりカーネル層（WFP）でパケットを自動横取りしてローカル中継 |
-| **WSL2 (Linux 側)**<br>(Ubuntu、Docker、curl、apt等) | **明示的プロキシ**<br>(Explicit Forward) | **環境変数 1 行**<br>(`export https_proxy=...`) | Windows ホストの `127.0.0.1:18080` へプロキシ指定することで確実に制御 |
+| **Windows ホスト**<br>(ブラウザ、SSH、RDP、CLI等) | **完全透過プロキシ**<br>(Transparent) | **設定一切不要**<br>(OS/アプリ設定 0) | WinDivert (WFP) によりカーネル層でパケットを自動横取りしてローカル中継 |
+| **Ubuntu (Linux) ホスト**<br>(ブラウザ、apt、Docker、curl等) | **完全透過プロキシ**<br>(Transparent) | **設定一切不要**<br>(OS/アプリ設定 0) | Linux Netfilter (`iptables` REDIRECT + `SO_ORIGINAL_DST`) で高速・自動中継 |
+| **WSL2 (Windows配下)**<br>(Ubuntu、Docker、curl、apt等) | **明示的プロキシ**<br>(Explicit Forward) | **環境変数 1 行**<br>(`export https_proxy=...`) | Windows ホストの `127.0.0.1:18080` へプロキシ指定することで確実に制御 |
 
 ---
 
@@ -90,7 +91,38 @@ WinDivert パケットドライバをロードするため、**「管理者と�
 
 ---
 
-## 2. 🐧 WSL2 での使い方（ミラーモード連携）
+## 2. 🐧 Ubuntu (Linux) ネイティブでのクイックスタート
+
+Ubuntu ネイティブ環境では、ドライバの追加インストールは不要です（Linux 標準の `iptables` を使用します）。
+
+### Step 1: ビルドする
+Ubuntu 上でビルドする場合：
+```bash
+go build -ldflags="-s -w" -o tproxy ./cmd/tproxy
+```
+*(Windows からクロスコンパイルする場合は `$env:GOOS="linux"; $env:GOARCH="amd64"; go build -ldflags="-s -w" -o tproxy ./cmd/tproxy`)*
+
+### Step 2: 起動する (sudo)
+```bash
+sudo ./tproxy
+```
+起動すると、Ubuntu ホスト上の全アプリ（curl, apt, ブラウザ, Docker 等）の通信が設定不要で自動的に透過制御されます。
+
+### 🛑 停止方法
+コンソールで **`Ctrl + C`** を押すと、`iptables` ルールが 100% 自動削除され、通常通信へ瞬時に復元します。
+
+### 🚀 systemd による常駐サービス化（推奨）
+付属のインストールスクリプトを実行するだけで、自動起動サービスとして登録できます：
+```bash
+sudo ./scripts/install-ubuntu.sh
+```
+- **サービス状態確認**: `sudo systemctl status tproxy`
+- **リアルタイムログ**: `sudo journalctl -u tproxy -f`
+- **万一のルール復元**: `sudo tproxy --cleanup`
+
+---
+
+## 3. 🐧 WSL2 での使い方（ミラーモード連携）
 
 WSL2 から `tproxy` を経由させるには、WSL のネットワークをミラーモードに設定し、プロキシ環境変数を指定します。
 

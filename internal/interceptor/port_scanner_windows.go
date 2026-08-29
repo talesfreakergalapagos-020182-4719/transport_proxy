@@ -1,3 +1,5 @@
+//go:build windows
+
 package interceptor
 
 import (
@@ -80,26 +82,6 @@ type processEntry32W struct {
 	PriClassBase      int32
 	Flags             uint32
 	ExeFile           [260]uint16
-}
-
-// ConflictingPortInfo stores details about a non-tproxy process using the reserved port range.
-type ConflictingPortInfo struct {
-	LocalPort   uint16
-	RemotePort  uint16
-	LocalIP     net.IP
-	RemoteIP    net.IP
-	State       string
-	PID         uint32
-	ProcessName string
-	ProcessPath string
-}
-
-// IsLoopback returns true if the socket is bound to a loopback address (127.0.0.1 or ::1).
-func (c *ConflictingPortInfo) IsLoopback() bool {
-	if c.LocalIP == nil {
-		return false
-	}
-	return c.LocalIP.IsLoopback()
 }
 
 // ScanReservedPortUsage scans both IPv4 and IPv6 Windows TCP tables and finds any non-tproxy process using ports in [portMin, portMax].

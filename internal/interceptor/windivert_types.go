@@ -1,9 +1,6 @@
-package interceptor
+//go:build windows
 
-import (
-	"encoding/binary"
-	"net"
-)
+package interceptor
 
 // WinDivert Layers
 const (
@@ -93,13 +90,6 @@ func (addr *WinDivertAddress) SetOutbound(outbound bool) {
 	}
 }
 
-// IP Header Protocol Numbers
-const (
-	IPPROTO_ICMP = 1
-	IPPROTO_TCP  = 6
-	IPPROTO_UDP  = 17
-)
-
 // TCP Flags
 const (
 	TCP_FIN = 1 << 0
@@ -112,108 +102,5 @@ const (
 	TCP_CWR = 1 << 7
 )
 
-// IPv4Header represents standard 20-byte minimum IPv4 Header.
-type IPv4Header struct {
-	VersionIHL uint8
-	TOS        uint8
-	Length     uint16
-	ID         uint16
-	FragOff    uint16
-	TTL        uint8
-	Protocol   uint8
-	Checksum   uint16
-	SrcIP      net.IP
-	DstIP      net.IP
-}
-
-// TCPHeader represents standard 20-byte minimum TCP Header.
-type TCPHeader struct {
-	SrcPort    uint16
-	DstPort    uint16
-	SeqNum     uint32
-	AckNum     uint32
-	DataOffset uint8 // in 32-bit words (5 = 20 bytes)
-	Flags      uint8
-	Window     uint16
-	Checksum   uint16
-	Urgent     uint16
-}
-
-// ParseIPv4Header parses an IPv4 header from raw packet bytes.
-func ParseIPv4Header(packet []byte) (*IPv4Header, int, error) {
-	if len(packet) < 20 {
-		return nil, 0, ErrPacketTooShort
-	}
-	ihl := int(packet[0]&0x0F) * 4
-	if ihl < 20 || len(packet) < ihl {
-		return nil, 0, ErrInvalidHeaderLength
-	}
-
-	hdr := &IPv4Header{
-		VersionIHL: packet[0],
-		TOS:        packet[1],
-		Length:     binary.BigEndian.Uint16(packet[2:4]),
-		ID:         binary.BigEndian.Uint16(packet[4:6]),
-		FragOff:    binary.BigEndian.Uint16(packet[6:8]),
-		TTL:        packet[8],
-		Protocol:   packet[9],
-		Checksum:   binary.BigEndian.Uint16(packet[10:12]),
-		SrcIP:      append(net.IP(nil), packet[12:16]...),
-		DstIP:      append(net.IP(nil), packet[16:20]...),
-	}
-	return hdr, ihl, nil
-}
-
-// ParseIPv4Fast parses an IPv4 header without any heap allocations.
-func ParseIPv4Fast(packet []byte) (proto uint8, srcIP, dstIP [4]byte, ihl int, err error) {
-	if len(packet) < 20 {
-		return 0, srcIP, dstIP, 0, ErrPacketTooShort
-	}
-	ihl = int(packet[0]&0x0F) * 4
-	if ihl < 20 || len(packet) < ihl {
-		return 0, srcIP, dstIP, 0, ErrInvalidHeaderLength
-	}
-	proto = packet[9]
-	copy(srcIP[:], packet[12:16])
-	copy(dstIP[:], packet[16:20])
-	return proto, srcIP, dstIP, ihl, nil
-}
-
-// ParseTCPFast parses a TCP header without any heap allocations.
-func ParseTCPFast(packet []byte, offset int) (srcPort, dstPort uint16, flags uint8, dataOffset int, err error) {
-	if len(packet) < offset+20 {
-		return 0, 0, 0, 0, ErrPacketTooShort
-	}
-	tcpBytes := packet[offset:]
-	dataOffset = int(tcpBytes[12]>>4) * 4
-	if dataOffset < 20 || len(tcpBytes) < dataOffset {
-		return 0, 0, 0, 0, ErrInvalidHeaderLength
-	}
-	srcPort = binary.BigEndian.Uint16(tcpBytes[0:2])
-	dstPort = binary.BigEndian.Uint16(tcpBytes[2:4])
-	flags = tcpBytes[13]
-	return srcPort, dstPort, flags, dataOffset, nil
-}
-
-// ParseTCPHeader parses a TCP header starting at offset in raw packet bytes (legacy helper).
-func ParseTCPHeader(packet []byte, offset int) (*TCPHeader, int, error) {
-	srcPort, dstPort, flags, dataOffset, err := ParseTCPFast(packet, offset)
-	if err != nil {
-		return nil, 0, err
-	}
-	tcpBytes := packet[offset:]
-	hdr := &TCPHeader{
-		SrcPort:    srcPort,
-		DstPort:    dstPort,
-		SeqNum:     binary.BigEndian.Uint32(tcpBytes[4:8]),
-		AckNum:     binary.BigEndian.Uint32(tcpBytes[8:12]),
-		DataOffset: uint8(dataOffset / 4),
-		Flags:      flags,
-		Window:     binary.BigEndian.Uint16(tcpBytes[14:16]),
-		Checksum:   binary.BigEndian.Uint16(tcpBytes[16:18]),
-		Urgent:     binary.BigEndian.Uint16(tcpBytes[18:20]),
-	}
-	return hdr, dataOffset, nil
-}
 
 

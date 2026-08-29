@@ -1,3 +1,5 @@
+//go:build windows
+
 package interceptor
 
 import (
@@ -15,62 +17,6 @@ import (
 	"transport_proxy/internal/logger"
 )
 
-// SessionKey uniquely identifies a client TCP session by source IP and port.
-// Designed with zero-allocation in mind (fixed-size byte array value type).
-type SessionKey struct {
-	IP   [16]byte // Holds 4-byte IPv4 (in first 4 bytes) or 16-byte IPv6
-	Port uint16
-	IsV6 bool
-}
-
-// MakeSessionKeyIPv4 creates a zero-alloc SessionKey from raw 4-byte IPv4.
-func MakeSessionKeyIPv4(ip [4]byte, port uint16) SessionKey {
-	var k SessionKey
-	copy(k.IP[:4], ip[:])
-	k.Port = port
-	return k
-}
-
-// MakeSessionKeyIPv6 creates a zero-alloc SessionKey from raw 16-byte IPv6.
-func MakeSessionKeyIPv6(ip [16]byte, port uint16) SessionKey {
-	var k SessionKey
-	copy(k.IP[:], ip[:])
-	k.Port = port
-	k.IsV6 = true
-	return k
-}
-
-// MakeSessionKeyFromNetIP creates a SessionKey from a standard net.IP.
-func MakeSessionKeyFromNetIP(ip net.IP, port uint16) SessionKey {
-	var k SessionKey
-	if ip4 := ip.To4(); ip4 != nil {
-		copy(k.IP[:4], ip4)
-	} else {
-		copy(k.IP[:], ip)
-		k.IsV6 = true
-	}
-	k.Port = port
-	return k
-}
-
-// DisplayString returns formatted IP:Port string for logging.
-func (k SessionKey) DisplayString() string {
-	if k.IsV6 {
-		return fmt.Sprintf("[%s]:%d", net.IP(k.IP[:]).String(), k.Port)
-	}
-	return fmt.Sprintf("%d.%d.%d.%d:%d", k.IP[0], k.IP[1], k.IP[2], k.IP[3], k.Port)
-}
-
-// SessionInfo stores original destination information for redirected connections.
-type SessionInfo struct {
-	OriginalDstIP   net.IP
-	OriginalDstPort uint16
-	IfIdx           uint32 // Original physical network interface index
-	SubIfIdx        uint32 // Original sub-interface index
-	CreatedAt       time.Time
-	LastSeen        atomic.Int64
-}
-
 type dryRunSessionInfo struct {
 	Domain   string
 	LastSeen atomic.Int64
@@ -85,21 +31,6 @@ type dnsTask struct {
 	payload    []byte
 	rawPacket  []byte
 	origAddr   WinDivertAddress
-}
-
-// FilterEvaluator checks if a host or IP should be blocked.
-type FilterEvaluator interface {
-	ShouldBlock(hostOrIP string) bool
-}
-
-// RoutingEvaluator resolves upstream proxy routing decisions.
-type RoutingEvaluator interface {
-	ResolveRouting(targetHost string, targetPort uint16) (isDirect bool, proxyURL string, err error)
-}
-
-// DNSEvaluator processes intercepted UDP DNS query packets.
-type DNSEvaluator interface {
-	ProcessDNSQuery(ctx context.Context, clientAddr net.Addr, dstIP net.IP, payload []byte) (respData []byte, passthrough bool)
 }
 
 // Redirector handles WinDivert packet interception, bi-directional NAT, session tracking, and dry-run auditing.
@@ -330,6 +261,14 @@ func (r *Redirector) LookupOriginalDestination(clientAddr net.Addr) (net.IP, uin
 	info := val.(*SessionInfo)
 	info.LastSeen.Store(time.Now().UnixNano())
 	return info.OriginalDstIP, info.OriginalDstPort, true
+}
+
+// LookupOriginalDestinationConn retrieves the original destination IP and port given a net.Conn.
+func (r *Redirector) LookupOriginalDestinationConn(conn net.Conn) (net.IP, uint16, bool) {
+	if conn == nil {
+		return nil, 0, false
+	}
+	return r.LookupOriginalDestination(conn.RemoteAddr())
 }
 
 // DeleteSession explicitly removes a session once connection is terminated.

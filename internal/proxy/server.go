@@ -24,7 +24,7 @@ type Server struct {
 	listener    net.Listener
 	cfgMgr      *config.Manager
 	filterEng   *filter.Engine
-	redirector  *interceptor.Redirector
+	redirector  interceptor.Interceptor
 	pacResolver *pac.Resolver
 	activeConns sync.WaitGroup
 	mu          sync.Mutex
@@ -32,7 +32,7 @@ type Server struct {
 }
 
 // NewServer creates a new transparent proxy server.
-func NewServer(cfgMgr *config.Manager, filterEng *filter.Engine, redirector *interceptor.Redirector, pacResolver *pac.Resolver) *Server {
+func NewServer(cfgMgr *config.Manager, filterEng *filter.Engine, redirector interceptor.Interceptor, pacResolver *pac.Resolver) *Server {
 	return &Server{
 		cfgMgr:      cfgMgr,
 		filterEng:   filterEng,
@@ -175,12 +175,15 @@ func (s *Server) handleClient(ctx context.Context, clientConn net.Conn) {
 
 	OptimizeTCPConn(clientConn)
 
-	// 1. Resolve original destination from NAT table
+	// 1. Resolve original destination from NAT table / SO_ORIGINAL_DST
 	var origIP net.IP
 	var origPort uint16
 	var found bool
 	if s.redirector != nil {
-		origIP, origPort, found = s.redirector.LookupOriginalDestination(clientConn.RemoteAddr())
+		origIP, origPort, found = s.redirector.LookupOriginalDestinationConn(clientConn)
+		if !found {
+			origIP, origPort, found = s.redirector.LookupOriginalDestination(clientConn.RemoteAddr())
+		}
 	}
 	if !found {
 		// Connection arrived without NAT tracking (explicit forward proxy connection, e.g. curl -x http://127.0.0.1:18080)

@@ -27,9 +27,6 @@ import (
 var (
 	version   = "1.0.0"
 	buildTime = "unspecified"
-
-	modShell32        = syscall.NewLazyDLL("shell32.dll")
-	procIsUserAnAdmin = modShell32.NewProc("IsUserAnAdmin")
 )
 
 type syncedWriter struct {
@@ -52,10 +49,20 @@ func main() {
 	dryRunShort := flag.Bool("d", false, "Run in dry-run audit mode (shorthand)")
 	logPathFlag := flag.String("log", "", "Path to output log file (in addition to console)")
 	logPathShort := flag.String("l", "", "Path to output log file (shorthand)")
+	cleanupFlag := flag.Bool("cleanup", false, "Clean up any residual platform redirection rules and exit")
 	flag.Parse()
 
+	if *cleanupFlag {
+		if err := cleanupPlatformRules(); err != nil {
+			fmt.Printf("Error cleaning up platform rules: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("Platform redirection rules cleaned up successfully.")
+		return
+	}
+
 	if *versionFlag || *versionShort {
-		fmt.Printf("Windows Transparent Proxy (tproxy) v%s (built %s)\n", version, buildTime)
+		fmt.Printf("Transparent Proxy Gateway (tproxy) v%s (built %s)\n", version, buildTime)
 		return
 	}
 
@@ -101,17 +108,17 @@ func main() {
 	}
 
 	log.Printf("================================================================")
-	log.Printf("  Windows Transparent Proxy v%s starting...", version)
+	log.Printf("  Transparent Proxy Gateway v%s starting...", version)
 	log.Printf("================================================================")
 
 	if isVerbose {
 		log.Printf("[Mode]   VERBOSE Debug Logging is ENABLED.")
 	}
 
-	// Check for administrative privileges (required for WinDivert driver)
+	// Check for administrative privileges (required for packet redirection / WinDivert / iptables)
 	if !isAdmin() {
-		log.Println("[WARNING] This application requires Administrator privileges to initialize WinDivert.")
-		log.Println("[WARNING] Please restart this application as Administrator (Elevated prompt).")
+		log.Println("[WARNING] This application requires elevated Administrator (Windows) or root/sudo (Linux) privileges.")
+		log.Println("[WARNING] Please restart this application with elevated privileges.")
 	}
 
 	log.Printf("[Config] Loaded configuration from %s", absConfigPath)
@@ -294,10 +301,4 @@ func main() {
 	portGuard.Stop()
 
 	log.Printf("[Shutdown] Graceful shutdown completed cleanly. Goodbye.")
-}
-
-// isAdmin checks if the current process is running with elevated Administrator privileges.
-func isAdmin() bool {
-	r, _, _ := procIsUserAnAdmin.Call()
-	return r != 0
 }
