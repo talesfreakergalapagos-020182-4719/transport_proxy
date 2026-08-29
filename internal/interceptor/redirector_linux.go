@@ -293,11 +293,10 @@ func (r *Redirector) dnsListenerLoop(ctx context.Context) {
 		copy(queryData, buf[:n])
 
 		origIP := extractOrigDstIP(oob[:oobn])
-		if origIP == nil || origIP.IsLoopback() {
-			// In Linux REDIRECT mode, original UDP destinations are often rewritten to loopback.
-			// To prevent DoH queries from looping to 127.0.0.1:443 (which causes immediate timeouts),
-			// and to avoid local passthrough blackholing, we force fallback to a public DoH server.
-			origIP = net.IPv4(8, 8, 8, 8)
+		if origIP == nil {
+			// Fallback to local loopback if original destination extraction fails.
+			// Do NOT spoof to 8.8.8.8, as this breaks corporate/WSL environments where external DNS is blocked.
+			origIP = net.IPv4(127, 0, 0, 1)
 		}
 
 		go func(cAddr net.Addr, qData []byte, dstIP net.IP) {
