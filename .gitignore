@@ -3,6 +3,7 @@
 *.exe~
 *.dll
 *.sys
+tproxy
 
 # Test binaries and coverage
 *.test
