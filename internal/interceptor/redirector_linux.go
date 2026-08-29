@@ -294,12 +294,15 @@ func (r *Redirector) applyIPTablesRules() error {
 		_ = execCmd("iptables", "-t", "nat", "-A", iptablesChainName, "-p", "udp", "--dport", "53", "-j", "REDIRECT", "--to-ports", dnsPortStr)
 	}
 
-	// 6. Link to OUTPUT chain (handles local processes on Ubuntu)
+	// 6. Link to OUTPUT and PREROUTING chains (handles local processes and routed traffic)
 	if err := execCmd("iptables", "-t", "nat", "-A", "OUTPUT", "-p", "tcp", "-j", iptablesChainName); err != nil {
 		return fmt.Errorf("failed to hook into OUTPUT chain: %w", err)
 	}
+	_ = execCmd("iptables", "-t", "nat", "-A", "PREROUTING", "-p", "tcp", "-j", iptablesChainName)
+
 	if r.dnsEng != nil {
 		_ = execCmd("iptables", "-t", "nat", "-A", "OUTPUT", "-p", "udp", "--dport", "53", "-j", iptablesChainName)
+		_ = execCmd("iptables", "-t", "nat", "-A", "PREROUTING", "-p", "udp", "--dport", "53", "-j", iptablesChainName)
 	}
 
 	return nil
@@ -307,9 +310,11 @@ func (r *Redirector) applyIPTablesRules() error {
 
 // removeIPTablesRules tears down the custom iptables chain cleanly.
 func (r *Redirector) removeIPTablesRules() error {
-	// Unlink from OUTPUT
+	// Unlink from OUTPUT and PREROUTING
 	_ = execCmd("iptables", "-t", "nat", "-D", "OUTPUT", "-p", "tcp", "-j", iptablesChainName)
 	_ = execCmd("iptables", "-t", "nat", "-D", "OUTPUT", "-p", "udp", "--dport", "53", "-j", iptablesChainName)
+	_ = execCmd("iptables", "-t", "nat", "-D", "PREROUTING", "-p", "tcp", "-j", iptablesChainName)
+	_ = execCmd("iptables", "-t", "nat", "-D", "PREROUTING", "-p", "udp", "--dport", "53", "-j", iptablesChainName)
 
 	// Flush and delete chain
 	_ = execCmd("iptables", "-t", "nat", "-F", iptablesChainName)
@@ -322,6 +327,8 @@ func (r *Redirector) removeIPTablesRules() error {
 func CleanupIPTables() error {
 	_ = execCmd("iptables", "-t", "nat", "-D", "OUTPUT", "-p", "tcp", "-j", iptablesChainName)
 	_ = execCmd("iptables", "-t", "nat", "-D", "OUTPUT", "-p", "udp", "--dport", "53", "-j", iptablesChainName)
+	_ = execCmd("iptables", "-t", "nat", "-D", "PREROUTING", "-p", "tcp", "-j", iptablesChainName)
+	_ = execCmd("iptables", "-t", "nat", "-D", "PREROUTING", "-p", "udp", "--dport", "53", "-j", iptablesChainName)
 	_ = execCmd("iptables", "-t", "nat", "-F", iptablesChainName)
 	_ = execCmd("iptables", "-t", "nat", "-X", iptablesChainName)
 	return nil
