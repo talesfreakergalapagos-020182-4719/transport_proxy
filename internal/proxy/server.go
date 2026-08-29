@@ -163,6 +163,9 @@ func (s *Server) handleClient(ctx context.Context, clientConn net.Conn) {
 	}()
 
 	defer func() {
+		if s.redirector != nil {
+			s.redirector.DeleteSession(clientConn.RemoteAddr())
+		}
 		_ = clientConn.Close()
 	}()
 

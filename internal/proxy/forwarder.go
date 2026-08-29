@@ -74,7 +74,7 @@ func (f *Forwarder) dialTCP(network, address string) (net.Conn, error) {
 		portMin     = 40000
 		portMax     = 48999
 		rangeSize   = portMax - portMin + 1
-		maxAttempts = 100
+		maxAttempts = rangeSize
 	)
 
 	var lastErr error
@@ -98,6 +98,9 @@ func (f *Forwarder) dialTCP(network, address string) (net.Conn, error) {
 		conn, err := dialer.Dial(network, address)
 		if err == nil {
 			OptimizeTCPConn(conn)
+			if tc, ok := conn.(*net.TCPConn); ok {
+				_ = tc.SetLinger(0) // Prevent TIME_WAIT port exhaustion on reserved outbound range
+			}
 			return conn, nil
 		}
 		lastErr = err
