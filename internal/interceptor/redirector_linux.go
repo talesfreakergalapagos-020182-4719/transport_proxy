@@ -267,6 +267,24 @@ func extractOrigDstIP(oob []byte) net.IP {
 	return nil
 }
 
+// getSystemDefaultDNS parses /etc/resolv.conf to find the actual system default nameserver.
+func getSystemDefaultDNS() net.IP {
+	data, err := os.ReadFile("/etc/resolv.conf")
+	if err == nil {
+		lines := strings.Split(string(data), "\n")
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "nameserver ") {
+				ipStr := strings.TrimSpace(strings.TrimPrefix(line, "nameserver "))
+				if ip := net.ParseIP(ipStr); ip != nil {
+					return ip
+				}
+			}
+		}
+	}
+	return net.IPv4(127, 0, 0, 1)
+}
+
 func (r *Redirector) dnsListenerLoop(ctx context.Context) {
 	buf := make([]byte, 4096)
 	oob := make([]byte, 2048)
@@ -293,10 +311,10 @@ func (r *Redirector) dnsListenerLoop(ctx context.Context) {
 		copy(queryData, buf[:n])
 
 		origIP := extractOrigDstIP(oob[:oobn])
-		if origIP == nil {
-			// Fallback to local loopback if original destination extraction fails.
-			// Do NOT spoof to 8.8.8.8, as this breaks corporate/WSL environments where external DNS is blocked.
-			origIP = net.IPv4(127, 0, 0, 1)
+		if origIP == nil || origIP.Equal(net.IPv4(127, 0, 0, 1)) {
+			// Fallback to the system default DNS if original destination extraction fails or returns localhost.
+			// This happens for locally generated UDP packets (OUTPUT chain REDIRECT).
+			origIP = getSystemDefaultDNS()
 		}
 
 		go func(cAddr net.Addr, qData []byte, dstIP net.IP) {
