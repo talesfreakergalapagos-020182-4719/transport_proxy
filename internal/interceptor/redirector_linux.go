@@ -293,7 +293,8 @@ func (r *Redirector) dnsListenerLoop(ctx context.Context) {
 
 		origIP := extractOrigDstIP(oob[:oobn])
 		if origIP == nil {
-			origIP = net.IPv4(127, 0, 0, 1) // Fallback
+			// Fallback to local loopback if original destination extraction fails
+			origIP = net.IPv4(127, 0, 0, 1)
 		}
 
 		go func(cAddr net.Addr, qData []byte, dstIP net.IP) {
@@ -329,17 +330,17 @@ func (r *Redirector) applyIPTablesRules() error {
 		_ = execCmd("iptables", "-t", "nat", "-A", iptablesChainName, "-m", "owner", "--uid-owner", uidStr, "-j", "RETURN")
 	}
 
-	// Bypass loopback traffic
+	// Redirect outbound UDP 53 DNS to local DNS UDP listener if enabled (Do this BEFORE loopback bypass to catch 127.0.0.42/53 etc)
+	if r.dnsEng != nil {
+		_ = execCmd("iptables", "-t", "nat", "-A", iptablesChainName, "-p", "udp", "--dport", "53", "-j", "REDIRECT", "--to-ports", dnsPortStr)
+	}
+
+	// Bypass loopback traffic (for TCP and other non-DNS traffic)
 	_ = execCmd("iptables", "-t", "nat", "-A", iptablesChainName, "-d", "127.0.0.0/8", "-j", "RETURN")
 
 	// Redirect outbound TCP to local proxy port
 	if err := execCmd("iptables", "-t", "nat", "-A", iptablesChainName, "-p", "tcp", "-j", "REDIRECT", "--to-ports", proxyPortStr); err != nil {
 		return fmt.Errorf("failed to add TCP redirect rule: %w", err)
-	}
-
-	// Redirect outbound UDP 53 DNS to local DNS UDP listener if enabled
-	if r.dnsEng != nil {
-		_ = execCmd("iptables", "-t", "nat", "-A", iptablesChainName, "-p", "udp", "--dport", "53", "-j", "REDIRECT", "--to-ports", dnsPortStr)
 	}
 
 	// Link to OUTPUT and PREROUTING chains (handles local processes and routed traffic)
@@ -362,12 +363,12 @@ func (r *Redirector) applyIPTablesRules() error {
 			_ = execCmd("ip6tables", "-t", "nat", "-A", iptablesChainName, "-m", "owner", "--uid-owner", uidStr, "-j", "RETURN")
 		}
 
-		_ = execCmd("ip6tables", "-t", "nat", "-A", iptablesChainName, "-d", "::1/128", "-j", "RETURN")
-		_ = execCmd("ip6tables", "-t", "nat", "-A", iptablesChainName, "-p", "tcp", "-j", "REDIRECT", "--to-ports", proxyPortStr)
-
 		if r.dnsEng != nil {
 			_ = execCmd("ip6tables", "-t", "nat", "-A", iptablesChainName, "-p", "udp", "--dport", "53", "-j", "REDIRECT", "--to-ports", dnsPortStr)
 		}
+
+		_ = execCmd("ip6tables", "-t", "nat", "-A", iptablesChainName, "-d", "::1/128", "-j", "RETURN")
+		_ = execCmd("ip6tables", "-t", "nat", "-A", iptablesChainName, "-p", "tcp", "-j", "REDIRECT", "--to-ports", proxyPortStr)
 
 		_ = execCmd("ip6tables", "-t", "nat", "-A", "OUTPUT", "-p", "tcp", "-j", iptablesChainName)
 		_ = execCmd("ip6tables", "-t", "nat", "-A", "PREROUTING", "-p", "tcp", "-j", iptablesChainName)

@@ -85,11 +85,7 @@ func (e *Engine) ProcessDNSQuery(ctx context.Context, clientAddr net.Addr, dstIP
 		return resp, false
 	}
 
-	// 3. Private / Local DNS IP Check (Immediate Passthrough without probing)
-	if e.probeMgr.IsPrivateIP(dstIP) {
-		logger.Debugf("[DNS]   Private/Local DNS IP %s -> Passing through without DoH", targetDisplay)
-		return nil, true
-	}
+	// (Removed Private/Local DNS IP Check: All intercepted DNS queries are now treated uniformly based on payload content, identical to Windows behavior)
 
 	// 4. DNS Answer Cache Check (0ms resolution)
 	if e.cache != nil && cfg.DNSCacheEnabled {
