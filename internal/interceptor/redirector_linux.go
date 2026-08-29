@@ -271,13 +271,15 @@ func (r *Redirector) applyIPTablesRules() error {
 		return fmt.Errorf("failed to create iptables chain %s: %w", iptablesChainName, err)
 	}
 
-	// 2. Bypass proxy process itself by UID to prevent self-interception loops
-	uidStr := strconv.Itoa(r.uid)
-	if err := execCmd("iptables", "-t", "nat", "-A", iptablesChainName, "-m", "owner", "--uid-owner", uidStr, "-j", "RETURN"); err != nil {
-		return fmt.Errorf("failed to add uid-owner bypass: %w", err)
+	// 2. Bypass proxy's own outbound connections by SO_MARK (0xff) to prevent self-interception loops
+	// Note: We use SO_MARK instead of --uid-owner so other root processes (e.g. 'sudo apt update') are also intercepted.
+	if err := execCmd("iptables", "-t", "nat", "-A", iptablesChainName, "-m", "mark", "--mark", "0xff", "-j", "RETURN"); err != nil {
+		// Fallback to uid-owner if mark module is unavailable in kernel
+		uidStr := strconv.Itoa(r.uid)
+		_ = execCmd("iptables", "-t", "nat", "-A", iptablesChainName, "-m", "owner", "--uid-owner", uidStr, "-j", "RETURN")
 	}
 
-	// 3. Bypass loopback and private/reserved ranges if needed
+	// 3. Bypass loopback traffic
 	_ = execCmd("iptables", "-t", "nat", "-A", iptablesChainName, "-d", "127.0.0.0/8", "-j", "RETURN")
 
 	// 4. Redirect outbound TCP to local proxy port
