@@ -119,8 +119,8 @@ func (r *Redirector) Start(ctx context.Context) error {
 	}
 	r.rulesApplied = true
 
-	log.Printf("[Redirector] Linux iptables REDIRECT rules active: TCP -> :%d, DNS -> :%d (UID %d bypassed)",
-		r.localProxyPort, r.localDNSUDPPort, r.uid)
+	log.Printf("[Redirector] Linux iptables REDIRECT rules active: TCP -> :%d, DNS -> :%d (SO_MARK 0xff bypassed)",
+		r.localProxyPort, r.localDNSUDPPort)
 
 	return nil
 }
