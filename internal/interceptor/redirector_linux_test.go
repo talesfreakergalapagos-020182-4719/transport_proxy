@@ -4,9 +4,7 @@ package interceptor
 
 import (
 	"context"
-	"net"
 	"testing"
-	"time"
 )
 
 func TestLinuxRedirector_Lifecycle(t *testing.T) {
