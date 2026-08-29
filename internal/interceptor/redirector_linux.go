@@ -261,40 +261,41 @@ func (r *Redirector) dnsListenerLoop(ctx context.Context) {
 	}
 }
 
-// applyIPTablesRules creates dedicated chain and sets up transparent redirection.
+// applyIPTablesRules creates dedicated chain and sets up transparent redirection for both IPv4 and IPv6.
 func (r *Redirector) applyIPTablesRules() error {
 	// First clean any stale rules from a previous unclean run
 	_ = r.removeIPTablesRules()
 
-	// 1. Create custom chain in nat table
+	proxyPortStr := strconv.Itoa(int(r.localProxyPort))
+	dnsPortStr := strconv.Itoa(int(r.localDNSUDPPort))
+
+	// -------------------------------------------------------------
+	// 1. Configure IPv4 iptables
+	// -------------------------------------------------------------
 	if err := execCmd("iptables", "-t", "nat", "-N", iptablesChainName); err != nil {
 		return fmt.Errorf("failed to create iptables chain %s: %w", iptablesChainName, err)
 	}
 
-	// 2. Bypass proxy's own outbound connections by SO_MARK (0xff) to prevent self-interception loops
-	// Note: We use SO_MARK instead of --uid-owner so other root processes (e.g. 'sudo apt update') are also intercepted.
+	// Bypass proxy's own outbound connections by SO_MARK (0xff) to prevent self-interception loops
 	if err := execCmd("iptables", "-t", "nat", "-A", iptablesChainName, "-m", "mark", "--mark", "0xff", "-j", "RETURN"); err != nil {
-		// Fallback to uid-owner if mark module is unavailable in kernel
 		uidStr := strconv.Itoa(r.uid)
 		_ = execCmd("iptables", "-t", "nat", "-A", iptablesChainName, "-m", "owner", "--uid-owner", uidStr, "-j", "RETURN")
 	}
 
-	// 3. Bypass loopback traffic
+	// Bypass loopback traffic
 	_ = execCmd("iptables", "-t", "nat", "-A", iptablesChainName, "-d", "127.0.0.0/8", "-j", "RETURN")
 
-	// 4. Redirect outbound TCP to local proxy port
-	proxyPortStr := strconv.Itoa(int(r.localProxyPort))
+	// Redirect outbound TCP to local proxy port
 	if err := execCmd("iptables", "-t", "nat", "-A", iptablesChainName, "-p", "tcp", "-j", "REDIRECT", "--to-ports", proxyPortStr); err != nil {
 		return fmt.Errorf("failed to add TCP redirect rule: %w", err)
 	}
 
-	// 5. Redirect outbound UDP 53 DNS to local DNS UDP listener if enabled
+	// Redirect outbound UDP 53 DNS to local DNS UDP listener if enabled
 	if r.dnsEng != nil {
-		dnsPortStr := strconv.Itoa(int(r.localDNSUDPPort))
 		_ = execCmd("iptables", "-t", "nat", "-A", iptablesChainName, "-p", "udp", "--dport", "53", "-j", "REDIRECT", "--to-ports", dnsPortStr)
 	}
 
-	// 6. Link to OUTPUT and PREROUTING chains (handles local processes and routed traffic)
+	// Link to OUTPUT and PREROUTING chains (handles local processes and routed traffic)
 	if err := execCmd("iptables", "-t", "nat", "-A", "OUTPUT", "-p", "tcp", "-j", iptablesChainName); err != nil {
 		return fmt.Errorf("failed to hook into OUTPUT chain: %w", err)
 	}
@@ -305,32 +306,72 @@ func (r *Redirector) applyIPTablesRules() error {
 		_ = execCmd("iptables", "-t", "nat", "-A", "PREROUTING", "-p", "udp", "--dport", "53", "-j", iptablesChainName)
 	}
 
+	// -------------------------------------------------------------
+	// 2. Configure IPv6 ip6tables (Dual-Stack IPv4/IPv6 support)
+	// -------------------------------------------------------------
+	if err := execCmd("ip6tables", "-t", "nat", "-N", iptablesChainName); err == nil {
+		if err := execCmd("ip6tables", "-t", "nat", "-A", iptablesChainName, "-m", "mark", "--mark", "0xff", "-j", "RETURN"); err != nil {
+			uidStr := strconv.Itoa(r.uid)
+			_ = execCmd("ip6tables", "-t", "nat", "-A", iptablesChainName, "-m", "owner", "--uid-owner", uidStr, "-j", "RETURN")
+		}
+
+		_ = execCmd("ip6tables", "-t", "nat", "-A", iptablesChainName, "-d", "::1/128", "-j", "RETURN")
+		_ = execCmd("ip6tables", "-t", "nat", "-A", iptablesChainName, "-p", "tcp", "-j", "REDIRECT", "--to-ports", proxyPortStr)
+
+		if r.dnsEng != nil {
+			_ = execCmd("ip6tables", "-t", "nat", "-A", iptablesChainName, "-p", "udp", "--dport", "53", "-j", "REDIRECT", "--to-ports", dnsPortStr)
+		}
+
+		_ = execCmd("ip6tables", "-t", "nat", "-A", "OUTPUT", "-p", "tcp", "-j", iptablesChainName)
+		_ = execCmd("ip6tables", "-t", "nat", "-A", "PREROUTING", "-p", "tcp", "-j", iptablesChainName)
+
+		if r.dnsEng != nil {
+			_ = execCmd("ip6tables", "-t", "nat", "-A", "OUTPUT", "-p", "udp", "--dport", "53", "-j", iptablesChainName)
+			_ = execCmd("ip6tables", "-t", "nat", "-A", "PREROUTING", "-p", "udp", "--dport", "53", "-j", iptablesChainName)
+		}
+	}
+
 	return nil
 }
 
-// removeIPTablesRules tears down the custom iptables chain cleanly.
+// removeIPTablesRules tears down both IPv4 and IPv6 iptables chains cleanly.
 func (r *Redirector) removeIPTablesRules() error {
-	// Unlink from OUTPUT and PREROUTING
+	// IPv4 Unlink and flush
 	_ = execCmd("iptables", "-t", "nat", "-D", "OUTPUT", "-p", "tcp", "-j", iptablesChainName)
 	_ = execCmd("iptables", "-t", "nat", "-D", "OUTPUT", "-p", "udp", "--dport", "53", "-j", iptablesChainName)
 	_ = execCmd("iptables", "-t", "nat", "-D", "PREROUTING", "-p", "tcp", "-j", iptablesChainName)
 	_ = execCmd("iptables", "-t", "nat", "-D", "PREROUTING", "-p", "udp", "--dport", "53", "-j", iptablesChainName)
-
-	// Flush and delete chain
 	_ = execCmd("iptables", "-t", "nat", "-F", iptablesChainName)
 	_ = execCmd("iptables", "-t", "nat", "-X", iptablesChainName)
+
+	// IPv6 Unlink and flush
+	_ = execCmd("ip6tables", "-t", "nat", "-D", "OUTPUT", "-p", "tcp", "-j", iptablesChainName)
+	_ = execCmd("ip6tables", "-t", "nat", "-D", "OUTPUT", "-p", "udp", "--dport", "53", "-j", iptablesChainName)
+	_ = execCmd("ip6tables", "-t", "nat", "-D", "PREROUTING", "-p", "tcp", "-j", iptablesChainName)
+	_ = execCmd("ip6tables", "-t", "nat", "-D", "PREROUTING", "-p", "udp", "--dport", "53", "-j", iptablesChainName)
+	_ = execCmd("ip6tables", "-t", "nat", "-F", iptablesChainName)
+	_ = execCmd("ip6tables", "-t", "nat", "-X", iptablesChainName)
 
 	return nil
 }
 
 // CleanupIPTables can be invoked from CLI (--cleanup) or crash handler.
 func CleanupIPTables() error {
+	// IPv4 cleanup
 	_ = execCmd("iptables", "-t", "nat", "-D", "OUTPUT", "-p", "tcp", "-j", iptablesChainName)
 	_ = execCmd("iptables", "-t", "nat", "-D", "OUTPUT", "-p", "udp", "--dport", "53", "-j", iptablesChainName)
 	_ = execCmd("iptables", "-t", "nat", "-D", "PREROUTING", "-p", "tcp", "-j", iptablesChainName)
 	_ = execCmd("iptables", "-t", "nat", "-D", "PREROUTING", "-p", "udp", "--dport", "53", "-j", iptablesChainName)
 	_ = execCmd("iptables", "-t", "nat", "-F", iptablesChainName)
 	_ = execCmd("iptables", "-t", "nat", "-X", iptablesChainName)
+
+	// IPv6 cleanup
+	_ = execCmd("ip6tables", "-t", "nat", "-D", "OUTPUT", "-p", "tcp", "-j", iptablesChainName)
+	_ = execCmd("ip6tables", "-t", "nat", "-D", "OUTPUT", "-p", "udp", "--dport", "53", "-j", iptablesChainName)
+	_ = execCmd("ip6tables", "-t", "nat", "-D", "PREROUTING", "-p", "tcp", "-j", iptablesChainName)
+	_ = execCmd("ip6tables", "-t", "nat", "-D", "PREROUTING", "-p", "udp", "--dport", "53", "-j", iptablesChainName)
+	_ = execCmd("ip6tables", "-t", "nat", "-F", iptablesChainName)
+	_ = execCmd("ip6tables", "-t", "nat", "-X", iptablesChainName)
 	return nil
 }
 
