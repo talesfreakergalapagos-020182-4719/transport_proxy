@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
@@ -292,9 +293,11 @@ func (r *Redirector) dnsListenerLoop(ctx context.Context) {
 		copy(queryData, buf[:n])
 
 		origIP := extractOrigDstIP(oob[:oobn])
-		if origIP == nil {
-			// Fallback to local loopback if original destination extraction fails
-			origIP = net.IPv4(127, 0, 0, 1)
+		if origIP == nil || origIP.IsLoopback() {
+			// In Linux REDIRECT mode, original UDP destinations are often rewritten to loopback.
+			// To prevent DoH queries from looping to 127.0.0.1:443 (which causes immediate timeouts),
+			// and to avoid local passthrough blackholing, we force fallback to a public DoH server.
+			origIP = net.IPv4(8, 8, 8, 8)
 		}
 
 		go func(cAddr net.Addr, qData []byte, dstIP net.IP) {
@@ -302,11 +305,49 @@ func (r *Redirector) dnsListenerLoop(ctx context.Context) {
 				return
 			}
 			respData, passthrough := r.dnsEng.ProcessDNSQuery(ctx, cAddr, dstIP, qData)
-			if !passthrough && len(respData) > 0 {
+			if passthrough {
+				respData = r.forwardUDPQuery(ctx, dstIP, 53, qData)
+			}
+			if len(respData) > 0 {
 				_, _ = r.dnsUDPConn.WriteTo(respData, cAddr)
 			}
 		}(clientAddr, queryData, origIP)
 	}
+}
+
+// forwardUDPQuery relays a DNS query to the original target using a marked socket to bypass iptables.
+func (r *Redirector) forwardUDPQuery(ctx context.Context, dstIP net.IP, port int, data []byte) []byte {
+	targetAddr := &net.UDPAddr{IP: dstIP, Port: port}
+	
+	dialer := &net.Dialer{
+		Timeout: 3 * time.Second,
+		Control: func(network, address string, c syscall.RawConn) error {
+			return c.Control(func(fd uintptr) {
+				// SO_MARK = 36 on Linux
+				_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, 36, 0xff)
+			})
+		},
+	}
+	
+	conn, err := dialer.DialContext(ctx, "udp", targetAddr.String())
+	if err != nil {
+		log.Printf("[DNS] UDP Passthrough failed to dial %s: %v", targetAddr, err)
+		return nil
+	}
+	defer conn.Close()
+
+	_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	if _, err := conn.Write(data); err != nil {
+		return nil
+	}
+
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	buf := make([]byte, 4096)
+	n, err := conn.Read(buf)
+	if err != nil {
+		return nil
+	}
+	return buf[:n]
 }
 
 // applyIPTablesRules creates dedicated chain and sets up transparent redirection for both IPv4 and IPv6.
