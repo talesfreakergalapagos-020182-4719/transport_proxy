@@ -176,7 +176,7 @@ export all_proxy=http://127.0.0.1:18080
 
 | キー | 型 | デフォルト | 説明 |
 | :--- | :---: | :---: | :--- |
-| `filter_mode` | `string` | `"whitelist"` | フィルタリングモード。`"whitelist"` / `"blacklist"` / `"all"`（全通し）。`"none"` / `"off"` / `"passthrough"` も全通しのエイリアスとして使用可 |
+| `filter_mode` | `string` | `"whitelist"` | フィルタリングモード。`"whitelist"` / `"blacklist"` / `"all"`（全通し）。`"none"` / `"off"` / `"disabled"` / `"passthrough"` も全通しのエイリアスとして使用可 |
 | `allowed_domains` | `[]string` | `[]` | **ホワイトリスト**で許可するドメイン・ワイルドカード（例: `"*.github.com"`） |
 | `allowed_ips` | `[]string` | `[]` | **ホワイトリスト**で許可する IP / CIDR（例: `"10.0.0.0/8"`） |
 | `blocked_domains` | `[]string` | `[]` | **ブラックリスト**で遮断するドメイン・ワイルドカード |
@@ -186,6 +186,7 @@ export all_proxy=http://127.0.0.1:18080
 | `upstream_proxy` | `string` | `""` | 固定上位 HTTP プロキシ URL（例: `"http://proxy.corp.local:8080"`） |
 | `bypass_sspi` | `bool` | `false` | `true` で上位プロキシへの Windows 統合認証（SSPI/NTLM）を無効化 |
 | `dns_servers` | `[]string` | `[]` | 上位 DNS サーバーの IP 一覧（IPv4: `"192.168.1.1"`, `"169.254.169.254"`, IPv6: `"2001:db8::1"` 等）。指定時は平文 UDP 53 直通バイパス。<br>**未指定（`[]`）時は自動で Cloudflare Security DoH（IPv4: `1.1.1.2`, `1.0.0.2` / IPv6: `2606:4700:4700::1112`, `2606:4700:4700::1002`）で暗号化解決** |
+| `doh_enabled` | `bool` | `true` | DNS クエリを自動的に DoH（DNS over HTTPS）に昇格するかどうか。`false` にすると DoH 変換を無効化し、平文 UDP 53 のみで名前解決 |
 | `doh_timeout_sec` | `int` | `3` | DoH クエリのタイムアウト秒数 |
 | `fallback_to_udp` | `bool` | `true` | DoH 失敗時に平文 UDP 53 へフォールバックするかどうか |
 | `dns_cache_enabled` | `bool` | `true` | インメモリ DNS キャッシュ（2 回目以降 0 ms 応答）の有効/無効 |
@@ -429,7 +430,8 @@ transport_proxy/
 │   └── logger/              # デバッグ・コンソールロガー
 ├── tools/mock_proxy/        # 検証用モックプロキシ（NTLM/SSO 認証・PAC サーバー内蔵）
 ├── scripts/
-│   └── install-ubuntu.sh    # Ubuntu systemd サービス登録スクリプト
+│   ├── install-ubuntu.sh    # Ubuntu systemd サービス登録スクリプト
+│   └── tproxy.service       # systemd ユニットファイル
 ├── WinDivert.dll            # WinDivert x64 ライブラリ
 ├── WinDivert64.sys          # WinDivert x64 カーネルドライバ
 ├── config.json              # 設定ファイル
