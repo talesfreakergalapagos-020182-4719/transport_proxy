@@ -180,6 +180,7 @@ export all_proxy=http://127.0.0.1:18080
 | `pac_url` | `string` | `""` | 上位プロキシの PAC/WPAD URL（例: `"http://wpad.corp.local/wpad.dat"`）。**※Windows版のみ対応（Ubuntu版では無視されます）** |
 | `upstream_proxy` | `string` | `""` | 固定上位 HTTP プロキシ URL（例: `"http://proxy.corp.local:8080"`） |
 | `bypass_sspi` | `bool` | `false` | `true` で上位プロキシへの Windows 統合認証（SSPI/NTLM）を無効化 |
+| `dns_servers` | `[]string` | `[]` | 上位 DNS サーバーの IP 一覧（例: GCP `["169.254.169.254"]`、AWS `["10.0.0.2"]`、社内 DNS `["192.168.1.1"]`）。指定時は平文直通バイパス。**空の場合は自動で Cloudflare Security DoH（1.1.1.2 等）を使用** |
 | `doh_enabled` | `bool` | `true` | 平文 DNS（UDP 53）を DNS-over-HTTPS へ自動昇格する機能の有効/無効 |
 | `doh_timeout_sec` | `int` | `3` | DoH クエリのタイムアウト秒数 |
 | `fallback_to_udp` | `bool` | `true` | DoH 失敗時に平文 UDP 53 へフォールバックするかどうか |

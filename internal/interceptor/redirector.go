@@ -126,6 +126,16 @@ func (r *Redirector) SetDNSEngine(dnsEng DNSEvaluator) {
 	r.dnsEng = dnsEng
 }
 
+// SetDNSServers configures custom upstream DNS servers.
+func (r *Redirector) SetDNSServers(dnsServers []string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(dnsServers) > 0 {
+		// Custom DNS is configured: allow direct bypass by disabling DNS interception
+		r.dnsEng = nil
+	}
+}
+
 // Start opens the WinDivert handle and starts packet processing and session GC loops.
 func (r *Redirector) Start(ctx context.Context) error {
 	r.mu.Lock()

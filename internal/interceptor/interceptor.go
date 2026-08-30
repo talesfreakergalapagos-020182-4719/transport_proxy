@@ -101,6 +101,7 @@ type Interceptor interface {
 	DeleteSession(clientAddr net.Addr)
 	SetDryRun(dryRun bool, forwardCond string, filterEng FilterEvaluator, routingEng RoutingEvaluator)
 	SetDNSEngine(dnsEng DNSEvaluator)
+	SetDNSServers(dnsServers []string)
 }
 
 // ConflictingPortInfo stores details about a non-tproxy process using a given port or port range.

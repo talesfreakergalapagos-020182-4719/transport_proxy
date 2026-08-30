@@ -27,18 +27,19 @@ const (
 
 // Redirector handles Linux iptables packet redirection, SO_ORIGINAL_DST resolution, and local DNS interception.
 type Redirector struct {
-	localProxyPort uint16
+	localProxyPort  uint16
 	localDNSUDPPort uint16
-	filterStr      string
-	dryRun         bool
-	filterEng      FilterEvaluator
-	routingEng     RoutingEvaluator
-	dnsEng         DNSEvaluator
-	dnsUDPConn     *net.UDPConn
-	uid            int
-	rulesApplied   bool
-	mu             sync.Mutex
-	closed         bool
+	filterStr       string
+	dryRun          bool
+	filterEng       FilterEvaluator
+	routingEng      RoutingEvaluator
+	dnsEng          DNSEvaluator
+	dnsServers      []string
+	dnsUDPConn      *net.UDPConn
+	uid             int
+	rulesApplied    bool
+	mu              sync.Mutex
+	closed          bool
 }
 
 // NewRedirector initializes a new Linux Redirector.
@@ -82,6 +83,13 @@ func (r *Redirector) SetDNSEngine(dnsEng DNSEvaluator) {
 	r.dnsEng = dnsEng
 }
 
+// SetDNSServers configures custom upstream DNS servers.
+func (r *Redirector) SetDNSServers(dnsServers []string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.dnsServers = dnsServers
+}
+
 // Start applies iptables redirection rules and starts local DNS interceptor.
 func (r *Redirector) Start(ctx context.Context) error {
 	r.mu.Lock()
@@ -96,8 +104,8 @@ func (r *Redirector) Start(ctx context.Context) error {
 		return nil
 	}
 
-	// 1. Start local UDP listener for DNS interception if DNS engine is attached
-	if r.dnsEng != nil {
+	// 1. Start local UDP listener for default Cloudflare DoH interception when no custom DNS is configured
+	if len(r.dnsServers) == 0 && r.dnsEng != nil {
 		dnsAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("127.0.0.1:%d", r.localDNSUDPPort))
 		if err != nil {
 			return fmt.Errorf("failed to resolve local DNS UDP address: %w", err)
@@ -113,7 +121,7 @@ func (r *Redirector) Start(ctx context.Context) error {
 
 		r.dnsUDPConn = conn
 		go r.dnsListenerLoop(ctx)
-		log.Printf("[Redirector] DNS UDP Interceptor listening on 127.0.0.1:%d", r.localDNSUDPPort)
+		log.Printf("[Redirector] DNS UDP Interceptor listening on 127.0.0.1:%d (Cloudflare Security DoH mode)", r.localDNSUDPPort)
 	}
 
 	// 2. Apply iptables redirection rules
@@ -125,8 +133,13 @@ func (r *Redirector) Start(ctx context.Context) error {
 	}
 	r.rulesApplied = true
 
-	log.Printf("[Redirector] Linux iptables REDIRECT rules active: TCP -> :%d, DNS -> :%d (SO_MARK 0xff bypassed)",
-		r.localProxyPort, r.localDNSUDPPort)
+	if len(r.dnsServers) > 0 {
+		log.Printf("[Redirector] Linux iptables REDIRECT rules active: TCP -> :%d (Custom DNS direct bypass: %v)",
+			r.localProxyPort, r.dnsServers)
+	} else {
+		log.Printf("[Redirector] Linux iptables REDIRECT rules active: TCP -> :%d, DNS -> :%d (Cloudflare Security DoH)",
+			r.localProxyPort, r.localDNSUDPPort)
+	}
 
 	return nil
 }
@@ -271,6 +284,9 @@ func (r *Redirector) dnsListenerLoop(ctx context.Context) {
 	buf := make([]byte, 4096)
 	oob := make([]byte, 2048)
 
+	// Default target: Cloudflare Security DNS
+	defaultTargetIP := net.IPv4(1, 1, 1, 2)
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -278,7 +294,7 @@ func (r *Redirector) dnsListenerLoop(ctx context.Context) {
 		default:
 		}
 
-		n, oobn, _, clientAddr, err := r.dnsUDPConn.ReadMsgUDP(buf, oob)
+		n, _, _, clientAddr, err := r.dnsUDPConn.ReadMsgUDP(buf, oob)
 		if err != nil {
 			r.mu.Lock()
 			isClosed := r.closed
@@ -292,28 +308,22 @@ func (r *Redirector) dnsListenerLoop(ctx context.Context) {
 		queryData := make([]byte, n)
 		copy(queryData, buf[:n])
 
-		origIP := extractOrigDstIP(oob[:oobn])
-		if origIP == nil || origIP.IsLoopback() {
-			// Drop packet if original destination is missing or loopback to avoid unroutable loops
-			continue
-		}
-
-		go func(cAddr net.Addr, qData []byte, dstIP net.IP) {
+		go func(cAddr net.Addr, qData []byte) {
 			if r.dnsEng == nil {
 				return
 			}
-			respData, passthrough := r.dnsEng.ProcessDNSQuery(ctx, cAddr, dstIP, qData)
+			respData, passthrough := r.dnsEng.ProcessDNSQuery(ctx, cAddr, defaultTargetIP, qData)
 			if passthrough {
-				respData = r.forwardUDPQuery(ctx, dstIP, 53, qData)
+				respData = r.forwardUDPQuery(ctx, defaultTargetIP, 53, qData)
 			}
 			if len(respData) > 0 {
 				_, _ = r.dnsUDPConn.WriteTo(respData, cAddr)
 			}
-		}(clientAddr, queryData, origIP)
+		}(clientAddr, queryData)
 	}
 }
 
-// forwardUDPQuery relays a DNS query to the original target using a marked socket to bypass iptables.
+// forwardUDPQuery relays a DNS query to the target using a marked socket to bypass iptables.
 func (r *Redirector) forwardUDPQuery(ctx context.Context, dstIP net.IP, port int, data []byte) []byte {
 	targetAddr := &net.UDPAddr{IP: dstIP, Port: port}
 	
@@ -356,6 +366,8 @@ func (r *Redirector) applyIPTablesRules() error {
 	proxyPortStr := strconv.Itoa(int(r.localProxyPort))
 	dnsPortStr := strconv.Itoa(int(r.localDNSUDPPort))
 
+	isCustomDNS := len(r.dnsServers) > 0
+
 	// -------------------------------------------------------------
 	// 1. Configure IPv4 iptables
 	// -------------------------------------------------------------
@@ -369,11 +381,19 @@ func (r *Redirector) applyIPTablesRules() error {
 		_ = execCmd("iptables", "-t", "nat", "-A", iptablesChainName, "-m", "owner", "--uid-owner", uidStr, "-j", "RETURN")
 	}
 
-	// Bypass all loopback traffic (127.0.0.0/8) including local DNS (e.g. systemd-resolved 127.0.0.53) BEFORE any redirection
+	// Bypass all loopback traffic (127.0.0.0/8) including local DNS (e.g. systemd-resolved 127.0.0.53)
 	_ = execCmd("iptables", "-t", "nat", "-A", iptablesChainName, "-d", "127.0.0.0/8", "-j", "RETURN")
 
-	// Redirect outbound UDP 53 DNS to local DNS UDP listener if enabled
-	if r.dnsEng != nil {
+	// If custom DNS servers are specified, directly bypass them (allow direct plaintext UDP 53 communication)
+	if isCustomDNS {
+		for _, s := range r.dnsServers {
+			ip := net.ParseIP(strings.TrimSpace(s))
+			if ip != nil && ip.To4() != nil {
+				_ = execCmd("iptables", "-t", "nat", "-A", iptablesChainName, "-d", ip.String(), "-p", "udp", "--dport", "53", "-j", "RETURN")
+			}
+		}
+	} else if r.dnsEng != nil {
+		// Default mode: Redirect outbound UDP 53 DNS to local DoH converter
 		_ = execCmd("iptables", "-t", "nat", "-A", iptablesChainName, "-p", "udp", "--dport", "53", "-j", "REDIRECT", "--to-ports", dnsPortStr)
 	}
 
@@ -387,7 +407,7 @@ func (r *Redirector) applyIPTablesRules() error {
 		return fmt.Errorf("failed to hook into OUTPUT chain: %w", err)
 	}
 
-	if r.dnsEng != nil {
+	if !isCustomDNS && r.dnsEng != nil {
 		_ = execCmd("iptables", "-t", "nat", "-A", "OUTPUT", "-p", "udp", "--dport", "53", "-j", iptablesChainName)
 	}
 
@@ -400,10 +420,17 @@ func (r *Redirector) applyIPTablesRules() error {
 			_ = execCmd("ip6tables", "-t", "nat", "-A", iptablesChainName, "-m", "owner", "--uid-owner", uidStr, "-j", "RETURN")
 		}
 
-		// Bypass IPv6 loopback (::1/128) BEFORE any redirection
+		// Bypass IPv6 loopback (::1/128)
 		_ = execCmd("ip6tables", "-t", "nat", "-A", iptablesChainName, "-d", "::1/128", "-j", "RETURN")
 
-		if r.dnsEng != nil {
+		if isCustomDNS {
+			for _, s := range r.dnsServers {
+				ip := net.ParseIP(strings.TrimSpace(s))
+				if ip != nil && ip.To4() == nil {
+					_ = execCmd("ip6tables", "-t", "nat", "-A", iptablesChainName, "-d", ip.String(), "-p", "udp", "--dport", "53", "-j", "RETURN")
+				}
+			}
+		} else if r.dnsEng != nil {
 			_ = execCmd("ip6tables", "-t", "nat", "-A", iptablesChainName, "-p", "udp", "--dport", "53", "-j", "REDIRECT", "--to-ports", dnsPortStr)
 		}
 
@@ -411,7 +438,7 @@ func (r *Redirector) applyIPTablesRules() error {
 
 		_ = execCmd("ip6tables", "-t", "nat", "-A", "OUTPUT", "-p", "tcp", "-j", iptablesChainName)
 
-		if r.dnsEng != nil {
+		if !isCustomDNS && r.dnsEng != nil {
 			_ = execCmd("ip6tables", "-t", "nat", "-A", "OUTPUT", "-p", "udp", "--dport", "53", "-j", iptablesChainName)
 		}
 	}

@@ -38,14 +38,37 @@ type Config struct {
 	FallbackToUDP     bool     `json:"fallback_to_udp"`     // If true, fallback to standard UDP 53 DNS on DoH failure/unsupported (default: true)
 	DNSCacheEnabled   bool     `json:"dns_cache_enabled"`   // If true, enable in-memory caching of DNS answers (default: true)
 	DNSCacheTTLSec    int      `json:"dns_cache_ttl_sec"`   // Max TTL in seconds for DNS answer cache (default: 300)
+	DNSServers        []string `json:"dns_servers"`         // Custom upstream DNS servers (e.g. ["169.254.169.254"]). If empty, defaults to Cloudflare Security DoH (1.1.1.2)
+}
+
+// Default DNS server lists (Cloudflare Security DNS: Malware & Phishing Blocking)
+var (
+	DefaultDNSServersIPv4 = []string{"1.1.1.2", "1.0.0.2"}
+	DefaultDNSServersIPv6 = []string{"2606:4700:4700::1112", "2606:4700:4700::1002"}
+)
+
+// IsCustomDNS returns true if the user explicitly specified custom upstream DNS servers.
+func (c *Config) IsCustomDNS() bool {
+	return len(c.DNSServers) > 0
+}
+
+// GetEffectiveDNSServers returns the configured DNS servers, or default Cloudflare Security DNS if none specified.
+func (c *Config) GetEffectiveDNSServers() []string {
+	if len(c.DNSServers) > 0 {
+		return c.DNSServers
+	}
+	var defaults []string
+	defaults = append(defaults, DefaultDNSServersIPv4...)
+	defaults = append(defaults, DefaultDNSServersIPv6...)
+	return defaults
 }
 
 // BuildDivertFilter generates a complete WinDivert filter string capturing ALL TCP outbound traffic,
 // excluding loopback, local proxy port, and proxy outbound port range (40000-48999) to prevent self-interception loops.
-// When DohEnabled is true, it also captures outbound UDP port 53 traffic.
+// When DohEnabled is true and no custom DNS is configured, it also captures outbound UDP port 53 traffic.
 func (c *Config) BuildDivertFilter(localProxyPort uint16) (forwardCond string, fullFilter string) {
 	dohFilter := ""
-	if c.DohEnabled {
+	if c.DohEnabled && !c.IsCustomDNS() {
 		dohFilter = " or (outbound and udp and udp.DstPort == 53 and !loopback)"
 	}
 
@@ -78,6 +101,7 @@ func DefaultConfig() *Config {
 		AllowedIPs:        []string{},
 		BlockedDomains:    []string{},
 		BlockedIPs:        []string{},
+		DNSServers:        []string{},
 		DivertFilter:      "",
 		DryRun:            false,
 		ConnectTimeoutSec: 10,

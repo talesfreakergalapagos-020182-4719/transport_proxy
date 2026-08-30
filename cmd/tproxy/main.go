@@ -217,12 +217,15 @@ func main() {
 		log.Fatalf("[FATAL] Failed to initialize WinDivert redirector: %v", err)
 	}
 	redirector.SetDryRun(isDryRun, forwardCond, filterEng, pacResolver)
+	redirector.SetDNSServers(cfg.DNSServers)
 
 	// 5. Initialize DNS-to-DoH Engine
 	dnsEng := dns.NewEngine(cfgMgr, filterEng, pacResolver)
 	redirector.SetDNSEngine(dnsEng)
-	if cfg.DohEnabled {
-		log.Printf("[DNS-DoH] Dynamic DNS-to-DoH auto-upgrade is ENABLED (Auto-detect IP-cert DoH servers)")
+	if cfg.IsCustomDNS() {
+		log.Printf("[DNS] Custom Upstream DNS configured: %v (Direct bypass enabled)", cfg.DNSServers)
+	} else if cfg.DohEnabled {
+		log.Printf("[DNS] No custom DNS configured. Using default Cloudflare Security DoH (1.1.1.2 / 1.0.0.2 / 2606:4700:4700::1112 / 2606:4700:4700::1002)")
 	}
 
 	// Panic safety recovery handler to ensure network restoration even on critical failure
