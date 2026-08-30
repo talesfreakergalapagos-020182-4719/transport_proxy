@@ -1,288 +1,246 @@
-# Cross-Platform Transparent & Forward Proxy Gateway (tproxy)
+# tproxy — Cross-Platform Transparent Proxy Gateway
 
-> ### 🌐 Windows & Ubuntu (Linux) 両対応。設定ゼロの完全透過制御 ＆ ハイブリッドプロキシ。
-> **ブラウザ・CLI (curl/apt)・SSH・RDP・Docker、そして WSL まで——PC 上の全通信を安全に制御・監査・中継する多機能プロキシゲートウェイ。**
-
----
-
-## 💡 本ツールの設計コンセプト（ハイブリッドプロキシ）
-
-`tproxy` は、OS やアプリにプロキシ設定を一切行わずに通信を横取りする「完全透過プロキシ」および「明示的フォワードプロキシ（HTTP CONNECT）」が完全共存する多機能プロキシゲートウェイです。  
-同一の `config.json` で **Windows および Ubuntu (Linux) ネイティブ環境の両方** を 100% 同一のポリシーで制御できます。
-
-### 📌 プラットフォーム別の制御方式
-
-| 対象環境 | 制御方式 | 設定方法 | 動作の仕組み |
-| :--- | :--- | :--- | :--- |
-| **Windows ホスト**<br>(ブラウザ、SSH、RDP、CLI等) | **完全透過プロキシ**<br>(Transparent) | **設定一切不要**<br>(OS/アプリ設定 0) | WinDivert (WFP) によりカーネル層でパケットを自動横取りしてローカル中継 |
-| **Ubuntu (Linux) ホスト**<br>(ブラウザ、apt、Docker、curl等) | **完全透過プロキシ**<br>(Transparent) | **設定一切不要**<br>(OS/アプリ設定 0) | Linux Netfilter (`iptables` REDIRECT + `SO_ORIGINAL_DST`) で高速・自動中継 |
-| **WSL2 (Windows配下)**<br>(Ubuntu、Docker、curl、apt等) | **明示的プロキシ**<br>(Explicit Forward) | **環境変数 1 行**<br>(`export https_proxy=...`) | Windows ホストの `127.0.0.1:18080` へプロキシ指定することで確実に制御 |
+> **Windows・Ubuntu (Linux) 両対応。** OS やアプリの設定を一切変えずに、PC 上の全通信をポリシー制御・監査・中継する多機能プロキシゲートウェイ。
 
 ---
 
-### ⚠️ なぜ WSL2 は「透過プロキシ」ができないのか？（技術的制約と解決策）
+## 📌 概要
 
-以前は「WSL も自動的に透過制御される」と期待されていましたが、技術検証の結果、以下の構造的理由により **WSL2 の通信を Windows ホスト側から透過的に横取りすることは原理的に不可能** であることが判明しました：
+`tproxy` は「**完全透過プロキシ**（Transparent）」と「**明示的フォワードプロキシ**（HTTP CONNECT）」を一つのバイナリで提供します。  
+同一の `config.json` で **Windows ホスト・Ubuntu ネイティブホスト・WSL2** の通信を同一ポリシーで制御できます。
 
-1. **Hyper-V 仮想スイッチ（NDIS Layer 2）によるバイパス**:  
-   WSL2 の仮想マシンが送信するパケットは、Windows ホストのパケットフィルタ層（WFP / WinDivert）よりも下層にある **Hyper-V vSwitch（Layer 2）** を通じて直接物理アダプタへ送出されます。
-2. **WinDivert のフックポイントを通過しない**:  
-   WinDivert の Layer 0（ネットワーク層）および Layer 1（IPフォワード層）のいずれを有効化しても、仮想マシンのパケットはホストの WFP スタックを通過しないため、ホスト側で透過的にキャッチすることができません。
-
-#### ✅ `tproxy` の解決策：ハイブリッドフォールバック
-WSL2 の通信を確実に制御・監査するため、`tproxy` のローカルリスナー（`18080`）に **「明示的 HTTP/HTTPS CONNECT プロキシ機能」** を統合しました。  
-WSL 側から `http://127.0.0.1:18080` をプロキシとして指定するだけで、**Windows ホスト側の透過制御と全く同一のポリシー（ホワイトリスト/ブラックリスト、DoH、社内プロキシ中継、ログ監査）が WSL からの通信にも 100% 適用** されます。
-
-> 🔒 **自端末 & WSL 限定のアクセス制限（オープンプロキシ化防止）**  
-> ポート `18080` への明示的プロキシ要求は、接続元 IP が **自端末（`127.0.0.1` / `::1`）または WSL 仮想サブネットであるかを厳格に自動検証** します。同一 LAN 内の他端末や外部からのアクセスはすべて `403 Forbidden` で即座に遮断されるため、踏み台（オープンプロキシ）として悪用されるセキュリティリスクはありません。
+| 対象環境 | 制御方式 | アプリ側の設定 | パケット取得方法 |
+| :--- | :--- | :---: | :--- |
+| **Windows ホスト**（ブラウザ・SSH・RDP・CLI 等） | 完全透過プロキシ | **不要** | WinDivert（WFP カーネル層） |
+| **Ubuntu ホスト**（curl・apt・Docker 等） | 完全透過プロキシ | **不要** | `iptables` REDIRECT + `SO_ORIGINAL_DST` |
+| **WSL2**（Ubuntu・curl・apt・Docker 等） | 完全透過プロキシ | **不要** | WinDivert（WFP カーネル層。要ミラーモード） |
 
 ---
 
-## 🚀 多機能化された核心機能一覧
+## 🚀 クイックスタート
 
-| 分類 | 機能 | メリット・詳細 |
-|:---:|:---|:---|
-| **透過制御** | 🌐 **Windows ゼロ設定の透過制御** | Windows 側はブラウザや CLI のプロキシ設定なしで全アプリの通信を自動制御 |
-| **WSL連携** | 🐧 **WSL2 ハイブリッドプロキシ** | `export https_proxy=http://127.0.0.1:18080` だけで Linux 側の通信も同一ポリシーで一括制御 |
-| **セキュリティ** | 🚦 **ホスト & IP フィルタリング** | ホワイトリスト/ブラックリスト、ワイルドカード（`*.example.com`）、CIDR（`10.0.0.0/8`）対応 |
-| **プロトコル** | 🧠 **L7 シグネチャ自動判別** | ポート番号に依存せず TLS / HTTP / SSH / RDP / VNC をパケット先頭シグネチャで自動識別 |
-| **DNS保護** | 🛡️ **DNS-over-HTTPS (DoH) 昇格** | 平文 DNS（UDP 53）を暗号化 DoH へ自動変換 ＆ 高速インメモリキャッシュ（0ms 応答） |
-| **エンタープライズ** | 🏢 **社内プロキシ ＆ Windows SSO** | 社内 NTLM / PAC プロキシへ Windows サインイン資格情報（SSPI）でパスワードレス自動ログイン |
-| **セッション維持** | ⏱️ **RDP / SSH 常時接続維持** | リモート操作・ターミナル等の無操作切断を自動防止（`idleTimeout=0` ＆ Keep-Alive） |
-| **安全性** | 🔒 **完全ローカル ＆ クラッシュセーフ** | 外部送信なし。終了時はカーネルがパケット横取りを 100% 自動解除して通常通信へ瞬時復帰 |
+### Windows 版
 
----
+#### 事前準備: WinDivert の配置（初回のみ）
 
-## 1. 🚀 クイックスタート（3ステップで今すぐ使う）
+[WinDivert 公式](https://reqrypt.org/windivert.html) または [GitHub Releases](https://github.com/basil00/Divert/releases) から最新 zip をダウンロードし、`x64\` フォルダ内の以下 2 ファイルを `tproxy.exe` と同じフォルダに置きます：
 
-### 📦 事前準備: WinDivert の入手（初回のみ）
-本アプリは Windows 上のパケット制御に **WinDivert** を使用します。`WinDivert.dll` と `WinDivert64.sys` を `tproxy.exe` と同じフォルダに配置してください：
+- `WinDivert.dll`
+- `WinDivert64.sys`
 
-1. [WinDivert 公式サイト](https://reqrypt.org/windivert.html) または [GitHub Releases](https://github.com/basil00/Divert/releases) から最新の zip をダウンロード。
-2. zip 内の `x64\` フォルダにある **`WinDivert.dll`** と **`WinDivert64.sys`** を `tproxy.exe` と同じフォルダにコピーします。
+#### Step 1: ビルド
 
----
-
-### Step 1: ビルドする
-PowerShell またはコマンドプロンプトで以下を実行します：
 ```powershell
 go build -ldflags="-s -w" -o tproxy.exe ./cmd/tproxy
 ```
 
-### Step 2: 設定ファイル（`config.json`）を確認する
-初期状態で開発者向け主要サイト（GitHub, Google, Go, NPM, Python, Docker 等）と Windows Update が許可されています。  
-通信を一切遮断せず全通しで試したい場合は、`config.json` を以下のようにするだけでOKです：
+#### Step 2: 管理者権限で起動
+
+**「管理者として実行」した PowerShell** で起動します（WinDivert ドライバのロードに必要）：
+
+```powershell
+.\tproxy.exe
+```
+
+これだけで、Windows PC 上のすべての通信が設定不要で透過的に制御されます。
+
+#### 停止
+
+`Ctrl + C` を押すと、WinDivert によるパケット横取りが 100% 自動解除され、通常通信に即時復元します。
+
+---
+
+### Ubuntu (Linux) 版
+
+ドライバの追加インストールは不要です。Linux 標準の `iptables` を使用します。
+
+#### Step 1: ビルド
+
+Ubuntu 上でビルドする場合：
+
+```bash
+go build -ldflags="-s -w" -o tproxy ./cmd/tproxy
+```
+
+Windows からクロスコンパイルする場合：
+
+```powershell
+$env:GOOS="linux"; $env:GOARCH="amd64"; go build -ldflags="-s -w" -o tproxy ./cmd/tproxy
+```
+
+#### Step 2: sudo で起動
+
+```bash
+sudo ./tproxy
+```
+
+起動すると、Ubuntu ホスト上の全アプリ（curl・apt・ブラウザ・Docker 等）の通信が自動的に透過制御されます。
+
+#### 停止
+
+`Ctrl + C` を押すと、`iptables` ルールが 100% 自動削除され、通常通信へ即時復元します。
+
+#### systemd による常駐サービス化（推奨）
+
+付属スクリプトを実行するだけで自動起動サービスとして登録できます：
+
+```bash
+sudo ./scripts/install-ubuntu.sh
+```
+
+| コマンド | 説明 |
+| :--- | :--- |
+| `sudo systemctl status tproxy` | サービス状態確認 |
+| `sudo journalctl -u tproxy -f` | リアルタイムログ |
+| `sudo tproxy -cleanup` | 万一のルール手動削除 |
+
+---
+
+### WSL2 での使い方
+
+WSL2 のネットワークをミラーモードに設定すれば、WSL2 上の通信は Windows ホストのネットワークスタックを共有するため、**WinDivert によって自動的に透過キャプチャ**されます。アプリ側のプロキシ設定は不要です。
+
+#### ① `.wslconfig` でミラーモードを有効化
+
+`%UserProfile%\.wslconfig` に以下を追記します：
+
+```ini
+[wsl2]
+networkingMode=mirrored
+firewall=true
+```
+
+設定後、PowerShell で `wsl --shutdown` を実行して WSL を再起動します。これだけで WSL2 上の curl・apt・Docker 等の通信が設定不要で tproxy に制御されます。
+
+#### ② プロキシ環境変数（おまけ）
+
+一部の特殊なツールでシステム設定が効かないケースなどに備え、明示的なプロキシ接続も引き続きサポートされています：
+
+```bash
+export http_proxy=http://127.0.0.1:18080
+export https_proxy=http://127.0.0.1:18080
+export all_proxy=http://127.0.0.1:18080
+```
+
+> **🔒 セキュリティ**: 明示的プロキシ（ポート `18080`）への接続元が `127.0.0.1` / `::1` または WSL 仮想サブネット以外の場合、即座に `403 Forbidden` で遮断されます（オープンプロキシ化防止）。
+
+---
+
+## ⚙️ 起動オプション
+
+| オプション | 説明 |
+| :--- | :--- |
+| *(なし)* | 通常起動。主要アクセスログをコンソール表示 |
+| `-v` / `-verbose` | 詳細ログ表示（パケット詳細・NAT 書き換え等） |
+| `-d` / `-dry-run` | ドライラン（遮断せず監査ログ出力のみ） |
+| `-log <file>` / `-l <file>` | コンソールと同時にファイルへログ保存 |
+| `-c <file>` | 設定ファイルのパスを指定 |
+| `-V` / `-version` | バージョン情報を表示して終了 |
+| `-cleanup` | 異常終了時に残った OS レベルの転送ルール（iptables 等）を削除して終了 |
+
+```powershell
+# 例: 詳細ログ + ファイル保存
+.\tproxy.exe -v -log tproxy.log
+```
+
+**ログ出力例:**
+
+```text
+[ALLOW] DNS-DoH          | Client: 192.168.1.10:54320 | Target: 1.1.1.2:53           | github.com (A) -> DoH (15ms)
+[ALLOW] HTTPS            | Client: 192.168.1.10:54321 | Target: github.com:443        -> DIRECT
+[ALLOW] HTTPS (EXPLICIT) | Client: 127.0.0.1:45530    | Target: api.example.com:443   -> DIRECT
+[BLOCK] HTTPS (EXPLICIT) | Client: 127.0.0.1:45532    | Target: blocked-site.com:443  -> Blocked by policy
+[CLOSE] Client: 127.0.0.1:45530 | Target: api.example.com:443 | Sent: 1.7 KB | Recv: 91.6 KB | Duration: 451ms
+```
+
+---
+
+## 📋 config.json 設定リファレンス
+
+設定ファイルは**ホットリロード対応**です。アプリ稼働中に編集・保存するだけで、再起動なしに即座に反映されます（デフォルト: 5 秒周期で変更検知）。
+
+### 全パラメータ一覧
+
+| キー | 型 | デフォルト | 説明 |
+| :--- | :---: | :---: | :--- |
+| `filter_mode` | `string` | `"whitelist"` | フィルタリングモード。`"whitelist"` / `"blacklist"` / `"all"`（全通し）。`"none"` / `"off"` / `"passthrough"` も全通しのエイリアスとして使用可 |
+| `allowed_domains` | `[]string` | `[]` | **ホワイトリスト**で許可するドメイン・ワイルドカード（例: `"*.github.com"`） |
+| `allowed_ips` | `[]string` | `[]` | **ホワイトリスト**で許可する IP / CIDR（例: `"10.0.0.0/8"`） |
+| `blocked_domains` | `[]string` | `[]` | **ブラックリスト**で遮断するドメイン・ワイルドカード |
+| `blocked_ips` | `[]string` | `[]` | **ブラックリスト**で遮断する IP / CIDR |
+| `listen_addr` | `string` | `"0.0.0.0:18080"` | ローカルプロキシの待受けアドレス（ポート衝突時は自動で別ポートへ退避） |
+| `pac_url` | `string` | `""` | 上位プロキシの PAC/WPAD URL（例: `"http://wpad.corp.local/wpad.dat"`） |
+| `upstream_proxy` | `string` | `""` | 固定上位 HTTP プロキシ URL（例: `"http://proxy.corp.local:8080"`） |
+| `bypass_sspi` | `bool` | `false` | `true` で上位プロキシへの Windows 統合認証（SSPI/NTLM）を無効化 |
+| `doh_enabled` | `bool` | `true` | 平文 DNS（UDP 53）を DNS-over-HTTPS へ自動昇格する機能の有効/無効 |
+| `doh_timeout_sec` | `int` | `3` | DoH クエリのタイムアウト秒数 |
+| `fallback_to_udp` | `bool` | `true` | DoH 失敗時に平文 UDP 53 へフォールバックするかどうか |
+| `dns_cache_enabled` | `bool` | `true` | インメモリ DNS キャッシュ（2 回目以降 0 ms 応答）の有効/無効 |
+| `dns_cache_ttl_sec` | `int` | `300` | DNS キャッシュの最大保持秒数（TTL） |
+| `connect_timeout_sec` | `int` | `10` | 上流サーバー / 上位プロキシへの TCP 接続タイムアウト秒数 |
+| `idle_timeout_sec` | `int` | `120` | 無通信接続の切断秒数。`0` で無期限維持（RDP・SSH に推奨） |
+| `reload_interval_sec` | `int` | `5` | 設定ファイルの変更検知周期（秒） |
+| `log_file` | `string` | `""` | ログ出力先ファイルパス。空文字はコンソールのみ |
+| `dry_run` | `bool` | `false` | `true` で通信を変更せず監査ログ出力のみのドライランモード |
+| `divert_filter` | `string` | `""` (自動生成) | WinDivert のカスタムキャプチャ条件（通常は空推奨） |
+
+### 設定例
+
+#### パターン 1: ホワイトリスト（推奨・セキュア運用）
+
+指定したドメイン・IP 宛てのみを許可し、未知のサイトをすべて遮断します：
+
+```json
+{
+  "filter_mode": "whitelist",
+  "allowed_domains": [
+    "github.com", "*.github.com", "*.githubusercontent.com",
+    "google.com", "*.google.com",
+    "*.microsoft.com", "*.windowsupdate.com"
+  ],
+  "allowed_ips": [
+    "127.0.0.1", "::1",
+    "192.168.0.0/16", "10.0.0.0/8"
+  ]
+}
+```
+
+#### パターン 2: ブラックリスト
+
+特定のサイト・IP のみ遮断し、それ以外をすべて許可します：
+
+```json
+{
+  "filter_mode": "blacklist",
+  "blocked_domains": ["*.example-blocked.com", "badsite.example.org"],
+  "blocked_ips": ["198.51.100.25", "203.0.113.0/24"]
+}
+```
+
+#### パターン 3: 全通し（フィルタ無効）
+
+通信を一切遮断せず全通しで使う場合（動作確認・テスト用）：
+
 ```json
 {
   "filter_mode": "all"
 }
 ```
 
-### Step 3: 管理者権限で起動する
-WinDivert パケットドライバをロードするため、**「管理者として実行」した PowerShell** で起動します：
-```powershell
-.\tproxy.exe
-```
+#### パターン 4: 社内プロキシ・PAC 連携
 
-これだけで、Windows PC 上のすべての通信が透過的に保護・制御されます（Windows 側のアプリやブラウザの設定変更は一切不要です）。
-
-### 🛑 停止方法
-コンソールで **`Ctrl + C`** を押すと、直ちにパケットの横取りが 100% 自動解除され、OS 標準の通常通信へ瞬時に復元して安全に終了します。
-
----
-
-## 2. 🐧 Ubuntu (Linux) ネイティブでのクイックスタート
-
-Ubuntu ネイティブ環境では、ドライバの追加インストールは不要です（Linux 標準の `iptables` を使用します）。
-
-### Step 1: ビルドする
-Ubuntu 上でビルドする場合：
-```bash
-go build -ldflags="-s -w" -o tproxy ./cmd/tproxy
-```
-*(Windows からクロスコンパイルする場合は `$env:GOOS="linux"; $env:GOARCH="amd64"; go build -ldflags="-s -w" -o tproxy ./cmd/tproxy`)*
-
-### Step 2: 起動する (sudo)
-```bash
-sudo ./tproxy
-```
-起動すると、Ubuntu ホスト上の全アプリ（curl, apt, ブラウザ, Docker 等）の通信が設定不要で自動的に透過制御されます。
-
-### 🛑 停止方法
-コンソールで **`Ctrl + C`** を押すと、`iptables` ルールが 100% 自動削除され、通常通信へ瞬時に復元します。
-
-### 🚀 systemd による常駐サービス化（推奨）
-付属のインストールスクリプトを実行するだけで、自動起動サービスとして登録できます：
-```bash
-sudo ./scripts/install-ubuntu.sh
-```
-- **サービス状態確認**: `sudo systemctl status tproxy`
-- **リアルタイムログ**: `sudo journalctl -u tproxy -f`
-- **万一のルール復元**: `sudo tproxy --cleanup`
-
----
-
-## 3. 🐧 WSL2 での使い方（ミラーモード連携）
-
-WSL2 から `tproxy` を経由させるには、WSL のネットワークをミラーモードに設定し、プロキシ環境変数を指定します。
-
-### ① WSL のネットワーク設定 (`%UserProfile%\.wslconfig`)
-Windows 側の `%UserProfile%\.wslconfig` に以下を記述します：
-```ini
-[wsl2]
-networkingMode=mirrored
-firewall=true
-```
-※ 設定後、PowerShell で `wsl --shutdown` を実行して WSL を再起動します。
-
-### ② WSL ターミナルでプロキシを設定
-WSL 内の `~/.bashrc` またはターミナルで以下を実行します：
-```bash
-# プロキシ環境変数を設定（ミラーモード時は 127.0.0.1 で Windows ホストの tproxy に直結）
-export http_proxy=http://127.0.0.1:18080
-export https_proxy=http://127.0.0.1:18080
-export all_proxy=http://127.0.0.1:18080
-
-# 動作確認（curl でアクセス）
-curl -v https://www.google.com
-```
-
-> **💡 単発テスト**: 環境変数を設定せず `curl -v -x http://127.0.0.1:18080 https://www.alpha.co.jp` のように `-x` オプションで直接テストすることも可能です。  
-> **💡 永続化**: `~/.bashrc` の末尾に上記 `export` を追記しておくと、WSL 起動時に自動でプロキシが適用されます。
-
----
-
-## 3. 📖 基本的な使い方・コマンド集
-
-### ① 通常起動（推奨）
-主要なアクセスログのみをシンプルに出力します：
-```powershell
-.\tproxy.exe
-```
-**ログ出力例:**
-```text
-# Windows 側の透過通信
-[ALLOW] DNS-DoH          | Client: 192.168.1.50:54320 | Target: 1.1.1.2:53                    | Query: github.com (A) -> DoH (15ms)
-[ALLOW] HTTPS            | Client: 192.168.1.50:54321 | Target: github.com:443                -> DIRECT
-
-# WSL 側の明示的プロキシ通信
-[ALLOW] HTTPS (EXPLICIT) | Client: 127.0.0.1:45530    | Target: www.alpha.co.jp:443            -> DIRECT
-[BLOCK] HTTPS (EXPLICIT) | Client: 127.0.0.1:45532    | Target: dangerous-site.com:443        -> Blocked by policy
-[CLOSE] Client: 127.0.0.1:45530 | Target: www.alpha.co.jp:443 | Sent: 1.7 KB | Recv: 91.6 KB | Duration: 451ms
-```
-
-### ② 詳細ログ付き起動 (`-v` / `-verbose`)
-パケットの送受信、NAT書き換え、非同期接続の詳細など、トラブルシューティング用のログを表示します：
-```powershell
-.\tproxy.exe -v
-```
-
-### ③ ドライラン起動 (`-d` / `-dry-run`)
-通信を遮断・変更せず、パッシブに監視して「許可/遮断のシミュレーション結果」のみを出力します（本番導入前の監査に最適）：
-```powershell
-.\tproxy.exe -d
-```
-
-### ④ ログファイルへの保存 (`-log` / `-l`)
-コンソールへの表示と同時に、指定したファイルへログを出力・保存します（起動ごとにファイルを新規上書きします）：
-```powershell
-.\tproxy.exe -log log.txt
-```
-*(短縮形: `.\tproxy.exe -l log.txt`)*
-
-> **💡 ヒント**: `config.json` に `"log_file": "log.txt"` を記述しておくと、引数なしの起動でも自動的にファイルへ保存されます。
-
-### ⑤ 設定ファイルを指定して起動 (`-c`)
-```powershell
-.\tproxy.exe -c C:\path\to\my_config.json
-```
-
----
-
-## 4. ⚙️ 設定ファイル（`config.json`）の書き方
-
-設定ファイルは **アプリ稼働中に編集・保存しても、再起動不要で即座に自動反映（ホットリロード）** されます。
-
-### 📋 全設定パラメータ一覧（完全リファレンス）
-
-| キー名 | 型 | デフォルト値 | 説明 |
-| :--- | :---: | :---: | :--- |
-| **`filter_mode`** | `string` | `"whitelist"` | フィルタリングモード。`"whitelist"`（許可リストのみ）、`"blacklist"`（拒否リストのみ）、`"all"` / `"none"`（全通し）から選択。 |
-| **`allowed_domains`** | `[]string` | `[]` | ホワイトリスト時に通信を許可するドメイン・ワイルドカード一覧（例: `["*.github.com", "google.com"]`）。 |
-| **`allowed_ips`** | `[]string` | `[]` | ホワイトリスト時に通信を許可する IP アドレス / CIDR 一覧（例: `["127.0.0.1", "10.0.0.0/8"]`）。 |
-| **`blocked_domains`** | `[]string` | `[]` | ブラックリスト時に通信を遮断するドメイン・ワイルドカード一覧（例: `["*.badsite.com"]`）。 |
-| **`blocked_ips`** | `[]string` | `[]` | ブラックリスト時に通信を遮断する IP アドレス / CIDR 一覧（例: `["198.51.100.25", "203.0.113.0/24"]`）。 |
-| **`listen_addr`** | `string` | `"0.0.0.0:18080"` | ローカルプロキシサーバーの待受けアドレス（ポート衝突時は自動で別ポートへ退避）。 |
-| **`pac_url`** | `string` | `""` | 上位プロキシ自動構成スクリプト（PAC/WPAD）の URL（例: `"http://wpad.corp.local/wpad.dat"`）。 |
-| **`upstream_proxy`** | `string` | `""` | 固定上位 HTTP プロキシ URL（例: `"http://proxy.corp.local:8080"`）。 |
-| **`bypass_sspi`** | `bool` | `false` | `true` にすると上位プロキシへの Windows 統合認証（SSPI / NTLM / Kerberos）を無効化。 |
-| **`doh_enabled`** | `bool` | `true` | 平文 DNS（UDP 53）を DNS-over-HTTPS (DoH) へ自動昇格する機能の有効/無効。 |
-| **`doh_timeout_sec`** | `int` | `3` | DoH クエリのタイムアウト秒数。 |
-| **`fallback_to_udp`** | `bool` | `true` | DoH 失敗時または非対応の際、平文 UDP 53 へフォールバックするかどうか。 |
-| **`dns_cache_enabled`** | `bool` | `true` | インメモリ DNS キャッシュ（2回目以降 0ms 応答）の有効/無効。 |
-| **`dns_cache_ttl_sec`** | `int` | `300` | DNS キャッシュの最大保持秒数（TTL）。 |
-| **`connect_timeout_sec`**| `int` | `10` | 上流サーバー / 上位プロキシへの TCP 接続タイムアウト秒数。 |
-| **`idle_timeout_sec`** | `int` | `120` | アイドル（無通信）接続の切断秒数。`0` にすると無制限維持。 |
-| **`reload_interval_sec`**| `int` | `5` | 設定ファイルの変更検知＆ホットリロードの確認周期（秒）。 |
-| **`log_file`** | `string` | `""` | ログ出力先のファイルパス（例: `"log.txt"`）。空文字の場合はコンソールのみ。 |
-| **`dry_run`** | `bool` | `false` | `true` にすると通信を遮断・変更せず監査ログ出力のみを行うドライランモードで動作。 |
-| **`divert_filter`** | `string` | `""` (自動生成) | WinDivert のカスタムキャプチャ条件（※通常は空文字推奨。指定時は `outbound` と `!loopback` を必須付与）。 |
-
----
-
-### パターン 1: ホワイトリスト形式（おすすめ・セキュア運用）
-指定したドメイン・IP 宛てのみを許可し、未知のサイトをすべて自動遮断します（Windows / WSL 双方に共通適用）：
-```json
-{
-  "filter_mode": "whitelist",
-  "allowed_domains": [
-    "github.com",
-    "*.github.com",
-    "*.githubusercontent.com",
-    "google.com",
-    "*.google.com",
-    "*.microsoft.com",
-    "*.windowsupdate.com"
-  ],
-  "allowed_ips": [
-    "127.0.0.1",
-    "::1",
-    "192.168.0.0/16",
-    "10.0.0.0/8",
-    "fe80::/10",
-    "2001:db8::/32"
-  ]
-}
-```
-
-### パターン 2: ブラックリスト形式
-特定の危険なサイトや SNS のみを遮断し、それ以外をすべて許可します：
-```json
-{
-  "filter_mode": "blacklist",
-  "blocked_domains": [
-    "*.example-blocked.com",
-    "badsite.example.org"
-  ],
-  "blocked_ips": [
-    "198.51.100.25",
-    "203.0.113.0/24",
-    "2001:db8:evil::/48"
-  ]
-}
-```
-
-### パターン 3: 社内プロキシ・PAC ファイルの指定
 ```json
 {
   "filter_mode": "all",
-  "upstream_proxy": "http://proxy.corp.local:8080",
-  "pac_url": "http://wpad.corp.local/wpad.dat"
+  "pac_url": "http://wpad.corp.local/wpad.dat",
+  "upstream_proxy": "http://proxy.corp.local:8080"
 }
 ```
-> **※ 認証について**: 上位プロキシが統合Windows認証（NTLM / SSO）を要求する場合、Windowsのサインイン資格情報を使って自動認証（パスワードレス）されます。
 
-### パターン 4: DNS-over-HTTPS (DoH) とインメモリキャッシュの設定
+> 上位プロキシが NTLM/SSO 認証を要求する場合、Windows サインイン資格情報で自動認証（パスワードレス）されます。
+
+#### パターン 5: DNS-over-HTTPS（DoH）設定
+
 ```json
 {
   "doh_enabled": true,
@@ -292,117 +250,186 @@ curl -v https://www.google.com
   "dns_cache_ttl_sec": 300
 }
 ```
-* **`doh_enabled`**: DNS-to-DoH自動昇格機能の有効/無効（デフォルト: `true`）。
-* **`fallback_to_udp`**: 万が一DoH通信に失敗した際、通常の平文UDP 53で再試行して通信遮断を防ぐ（デフォルト: `true`）。
-* **`dns_cache_enabled`**: インメモリキャッシュの有効化（デフォルト: `true`）。2回目以降の同一クエリを0msで即座に応答します。
-* **`dns_cache_ttl_sec`**: キャッシュの最大保持秒数（デフォルト: `300` = 5分）。レコードのTTLに基づき定期的に自動更新されます。
 
-### パターン 5: タイムアウト設定と大容量・常時接続の挙動
+#### パターン 6: 常時接続維持（RDP・SSH 用）
+
 ```json
 {
-  "connect_timeout_sec": 10,
-  "idle_timeout_sec": 120
+  "idle_timeout_sec": 0
 }
 ```
-* **`connect_timeout_sec`**: 相手先サーバーや上位プロキシへの接続タイムアウト秒数（デフォルト: `10`秒）。
-* **`idle_timeout_sec`**: アイドル（**無通信**）状態が続いた場合にソケットを安全に解放する秒数（デフォルト: `120`秒）。
-  * **💡 大容量ダウンロードへの影響**: この設定は「通信上限時間」ではなく「無通信時間」の監視です。データが流れている間は**パケットを受信するたびに期限が自動延長**されるため、数時間・数十GBに及ぶ巨大ファイルのダウンロードでも**途中で切断されることはありません**。
-  * **💡 `0` の指定（無期限維持）**: `"idle_timeout_sec": 0` を指定すると、全プロトコルで無通信タイムアウトを無効化し、OS の TCP Keep-Alive（30秒間隔）のみで接続を常時維持します。
+
+`"idle_timeout_sec": 0` で全プロトコルの無通信タイムアウトを無効化し、OS の TCP Keep-Alive（30 秒間隔）のみで常時維持します。  
+大容量ダウンロード中は「データが流れている限りタイムアウトが自動延長」されるため、数十 GB のファイル転送も途中切断しません。
 
 ---
 
-## 5. 🏛️ アーキテクチャと詳細な仕組み（技術解説）
+## 🏛️ アーキテクチャ解説
 
-### 5-1. 透過プロキシ ＆ ハイブリッド中継の仕組み
+### Windows 版の仕組み
 
-OS のネットワーク層（Windows Filtering Platform）でパケットを直接横取りしてローカルリスナー（`18080`）へ引き込む透過ルートと、WSL からの明示的 CONNECT ルートが同一エンジンで処理されます。
+Windows 版は **WinDivert**（Windows Filtering Platform ベースのカーネルドライバ）を使い、OS ネットワーク層でアウトバウンドパケットを直接キャプチャします。アプリ側にプロキシ設定は一切不要です。
 
 ```text
-┌────────────────────────────────────────────────────────┐
-│ 【Windows ホスト側アプリ】                             │
-│   ブラウザ / SSH / RDP / 各種CLI（プロキシ設定なし）    │
-└────────────────────────┬───────────────────────────────┘
-                         ▼
-        [ ① WinDivert（カーネルパケット捕捉）]
-                         │
-                         ▼
-┌────────────────────────────────────────────────────────┐     ┌────────────────────────┐
-│ [ ② ローカルプロキシ（[::]:18080 Dual-Stack）]          │ ◄───┤ 【WSL2 / 外部ツール】   │
-│   ・透過接続: NATテーブル逆引きで本来の宛先を特定      │     │   export https_proxy   │
-│   ・直接接続: HTTP CONNECT / GET を自動パース          │     └────────────────────────┘
-└────────────────────────┬───────────────────────────────┘
-                         │
-                         ▼
-┌────────────────────────────────────────────────────────┐
-│ [ ③ フィルタエンジン（常時適用）]                      │
-│   ├──【不許可】──→ ❌ 通信強制切断 (403 / RST)         │
-│   └──【許可】                                          │
-└────────────────────────┬───────────────────────────────┘
-                         │
-                         ▼
-┌────────────────────────────────────────────────────────┐
-│ [ ④ 動的プロトコルディスパッチャー ]                   │
-│   ├──【非Web通信 または 上位プロキシ未設定】           │
-│   │     └──→ 本アプリが相手先へ直接接続（DIRECT）       │
-│   └──【Web通信 かつ 上位プロキシ設定時】               │
-│         └──→ Windows統合認証（SSPI/NTLM）で自動ログイン │
-└────────────────────────┬───────────────────────────────┘
-                         │
-                         ▼
-┌────────────────────────────────────────────────────────┐
-│ [ ⑤ 上流サーバー / 社内プロキシサーバー ]              │
-└────────────────────────────────────────────────────────┘
+【Windows ホスト上のアプリ】
+  ブラウザ / SSH / RDP / curl など（プロキシ設定なし）
+         |
+         v  カーネル層でキャプチャ（WFP）
+  [1] WinDivert
+         |
+         +-- UDP 53 (DNS) --> DNS ワーカープール（16並列）
+         |                      |  DoH へ昇格 + インメモリキャッシュ
+         |                      v
+         |                    WinDivert で偽造応答を直接インジェクト
+         |
+         +-- TCP (その他)  --> パケットをループバックへリダイレクト
+                                |
+                                v
+  [2] ローカルプロキシ [::]:18080  <---- WSL2 / 外部ツール（明示的 CONNECT）
+       |  NATテーブル逆引きで本来の宛先 IP:Port を復元
+       v
+  [3] フィルタエンジン（ホワイト/ブラックリスト）
+       |  不許可 --> 強制切断 (403 / RST)
+       |  許可
+       v
+  [4] L7 プロトコルディスパッチャー（TLS SNI / HTTP Host / SSH / RDP 等を自動判別）
+       |  上位プロキシ未設定 --> DIRECT 接続
+       |  上位プロキシ設定時 --> SSPI/NTLM 自動認証 --> プロキシ経由
+       v
+  [5] 上流サーバー / 社内プロキシ
 ```
 
-### 5-2. ポート非依存のL7プロトコルシグネチャ自動判別
-通信開始時の先頭数バイト（暗号化ペイロードの復号は不要）から、**ポート番号に依存せずプロトコル種別を瞬時に自動判別**します：
+> DNS パケットはカーネル層で捕捉・応答まで完結するため、DoH 昇格後の応答パケットも WinDivert 経由で直接クライアントへ書き戻されます。
 
-| プロトコル | 先頭バイトシグネチャ（RFC/標準仕様） | 抽出情報 / 動作 |
-| :--- | :--- | :--- |
-| **HTTPS (TLS)** | `0x16 0x03` (TLS ClientHello) | **SNI（サーバー名）** を抽出してポリシー判定・上位プロキシへ中継 |
-| **HTTP (平文)** | `GET `, `POST `, `HEAD `, `CONNECT ` 等 | **`Host:` ヘッダー** を抽出してポリシー判定・上位プロキシへ中継 |
-| **Microsoft RDP** | `0x03 0x00 ... 0xE0` (TPKT v3 + X.224 CR PDU) | 非Web直接通信（DIRECT）+ **アイドルタイムアウト解除（常時接続）** |
-| **SSH** | `"SSH-"` (RFC 4253 バージョン交換バナー) | 非Web直接通信（DIRECT）+ **アイドルタイムアウト解除（常時接続）** |
-| **VNC** | `"RFB "` (RFC 6143 バナー) | 非Web直接通信（DIRECT）+ **アイドルタイムアウト解除（常時接続）** |
-| **その他 TCP** | 上記以外のバイナリストリーム | 宛先 IP:Port に基づき直接通信（DIRECT） |
+**終了時の安全性**: `Ctrl + C` で WinDivert ドライバが即時アンロードされ、パケット横取りが完全解除されます。OS の通常通信へ瞬時に復元します。
 
 ---
 
-## 6. 📁 ディレクトリ構成
+### Ubuntu (Linux) 版の仕組み
+
+Ubuntu 版は Linux 標準の **Netfilter** (`iptables`) を使い、ローカル発の TCP/UDP パケットをローカルプロキシへリダイレクトします。カーネル外部ドライバの追加インストールは不要です。
+
+```text
+【Ubuntu ホスト上のアプリ】
+  curl / apt / ブラウザ / Docker など（プロキシ設定なし）
+         |
+         v  iptables OUTPUT チェイン（TPROXY_RULES カスタムチェイン）
+  [1] Netfilter REDIRECT ルール
+         |
+         +-- UDP 53 (DNS) --> ローカル UDP リスナー :18180（プロキシポート + 100）
+         |                      |  SO_MARK=0xff でループ防止
+         |                      |  DoH へ昇格 + インメモリキャッシュ
+         |                      |  passthrough 時は SO_MARK 付きで平文 UDP 転送
+         |                      v
+         |                    UDP 応答をクライアントへ直接返送
+         |
+         +-- TCP (その他)  --> ローカルプロキシ :18080
+                                |
+                                v
+  [2] ローカルプロキシ 0.0.0.0:18080
+       |  SO_ORIGINAL_DST で本来の宛先 IP:Port を取得
+       v
+  [3] フィルタエンジン（ホワイト/ブラックリスト）
+       |  不許可 --> 強制切断
+       |  許可
+       v
+  [4] L7 プロトコルディスパッチャー
+       |  上位プロキシ未設定 --> DIRECT 接続
+       |  上位プロキシ設定時 --> プロキシ経由
+       v
+  [5] 上流サーバー / 社内プロキシ
+```
+
+> DNS は TCP プロキシとは独立した UDP リスナー（プロキシポート + 100、デフォルト `:18180`）で処理されます。プロキシ自身が発する DoH 通信および TCP アウトバウンド接続には `SO_MARK=0xff` を付与して iptables ルールをバイパスし、自己ループを防止しています。
+
+**終了時の安全性**: `Ctrl + C` で `iptables` / `ip6tables` のルールが全自動削除されます。`systemd` 経由の停止でも同様に自動クリーンアップされます。
+
+---
+
+### Windows 版と Ubuntu 版の違い
+
+| 比較項目 | Windows 版 | Ubuntu 版 |
+| :--- | :--- | :--- |
+| **パケット取得レイヤー** | WFP（Windows Filtering Platform）カーネル層 | Netfilter / iptables（Linux カーネル） |
+| **使用コンポーネント** | WinDivert.dll + WinDivert64.sys（外部ドライバ） | iptables / ip6tables（OS 標準） |
+| **宛先 IP の復元方法** | WinDivert NAT テーブル逆引き | `SO_ORIGINAL_DST` ソケットオプション |
+| **DNS パケットの取得方法** | WinDivert が UDP 53 をカーネル層で直接キャプチャ | iptables REDIRECT で別ポート（プロキシポート + 100）の UDP リスナーへ転送 |
+| **DNS 応答の返送方法** | WinDivert で偽造パケットを直接インジェクト | UDP ソケットでクライアントへ直接 `WriteTo` |  
+| **DoH ループ防止** | WinDivert フィルタのポート範囲で自動除外 | プロキシ発パケットに `SO_MARK=0xff` を付与して iptables をバイパス |
+| **起動権限** | 管理者（Administrator）必須 | sudo 必須 |
+| **終了時のクリーンアップ** | WinDivert ドライバ自動アンロード | iptables / ip6tables ルール自動削除 |
+| **上位プロキシ認証** | SSPI / NTLM / Kerberos（Windows SSO）対応 | 基本認証のみ（SSPI 非対応） |
+| **常駐サービス化** | Windows サービス（予定） | `systemd` スクリプト付属 |
+| **WSL2 との関係** | WSL2 の通信源として機能 | WSL2 自体が Ubuntu 版相当 |
+
+---
+
+### WSL2 のキャプチャ方式（NAT モード vs ミラーモード）
+
+- **NAT モード（旧仕様・デフォルト）**: WSL2 は独立した仮想 NIC を持ち、Hyper-V vSwitch（Layer 2）を通じて物理アダプタへ直接送出されるため、Windows 側の WFP（WinDivert）ではキャプチャできません。
+- **ミラーモード（Windows 11 22H2 以降）**: WSL2 が Windows ホストと IP ネットワークスタックを共有するため、WSL2 内部から発するパケットも Windows ホスト上のアプリと全く同様に **WinDivert で完全に透過キャプチャ可能** です。
+
+そのため、tproxy を WSL2 で透過的に利用する場合は、`networkingMode=mirrored` の設定を強く推奨します。
+
+---
+
+### L7 プロトコル自動判別
+
+通信開始の先頭数バイトを読み取り、**ポート番号に依存せずプロトコルを自動識別**します：
+
+| プロトコル | シグネチャ | 動作 |
+| :--- | :--- | :--- |
+| **HTTPS (TLS)** | `0x16 0x03`（TLS ClientHello） | SNI（サーバー名）を抽出してポリシー判定 |
+| **HTTP（平文）** | `GET ` / `POST ` / `CONNECT ` 等 | `Host:` ヘッダーを抽出してポリシー判定 |
+| **RDP** | `0x03 0x00 ... 0xE0`（TPKT v3 + X.224 CR） | DIRECT + アイドルタイムアウト自動解除 |
+| **SSH** | `"SSH-"`（RFC 4253 バナー） | DIRECT + アイドルタイムアウト自動解除 |
+| **VNC** | `"RFB "`（RFC 6143 バナー） | DIRECT + アイドルタイムアウト自動解除 |
+| **その他 TCP** | 上記以外 | 宛先 IP:Port に基づき DIRECT |
+
+---
+
+## 📁 ディレクトリ構成
 
 ```text
 transport_proxy/
-├── cmd/
-│   └── tproxy/
-│       └── main.go              # エントリポイント、管理者権限チェック、Graceful Shutdown
+├── cmd/tproxy/
+│   └── main.go              # エントリポイント・権限チェック・Graceful Shutdown
 ├── internal/
-│   ├── config/                  # 設定読み込み、ホットリロード、WinDivertフィルタ生成
-│   ├── dns/                     # DNS-to-DoH自動昇格、RFC 1035/8484パーサー、キャッシュ
-│   ├── filter/                  # ホワイトリスト/ブラックリスト/ALL-PASS判定エンジン
-│   ├── interceptor/             # WinDivert APIラッパー、ゼロアロケーションNAT、L7シグネチャ解析
-│   ├── pac/                     # WinHTTP WPAD/PAC自動解決、キャッシュエンジン
-│   ├── proxy/                   # 透過＋明示的ハイブリッドプロキシサーバー、SSPI、双方向パイプ
-│   ├── sspi/                    # Windows SSPI (secur32.dll) NTLM/Negotiate 認証
-│   └── logger/                  # デバッグ・コンソールロガー
-├── tools/
-│   └── mock_proxy/              # 検証用モックプロキシ（NTLM/SSO認証、PACサーバー内蔵）
-├── WinDivert.dll / .sys         # WinDivert x64 ドライバ・ライブラリ
-├── config.json                  # 設定ファイル
-└── README.md                    # 本ドキュメント
+│   ├── config/              # 設定読み込み・ホットリロード・WinDivert フィルタ生成
+│   ├── dns/                 # DNS-to-DoH 昇格・RFC 1035/8484 パーサー・キャッシュ
+│   ├── filter/              # ホワイトリスト/ブラックリスト判定エンジン
+│   ├── interceptor/         # WinDivert ラッパー・NAT・L7 シグネチャ解析
+│   ├── pac/                 # WinHTTP WPAD/PAC 自動解決・キャッシュ
+│   ├── proxy/               # 透過 + 明示的ハイブリッドプロキシ・SSPI・双方向パイプ
+│   ├── sspi/                # Windows SSPI (secur32.dll) NTLM/Negotiate 認証
+│   └── logger/              # デバッグ・コンソールロガー
+├── tools/mock_proxy/        # 検証用モックプロキシ（NTLM/SSO 認証・PAC サーバー内蔵）
+├── scripts/
+│   └── install-ubuntu.sh    # Ubuntu systemd サービス登録スクリプト
+├── WinDivert.dll            # WinDivert x64 ライブラリ
+├── WinDivert64.sys          # WinDivert x64 カーネルドライバ
+├── config.json              # 設定ファイル
+└── config.json.sample       # 設定ファイルのサンプル（全パラメータ記載）
 ```
 
 ---
 
-## 7. 🛠️ 動作要件・ビルド手順
+## 🛠️ 動作要件
 
-- **OS**: Windows 10 / 11 / Windows Server 2016 以降 (64-bit)
-- **権限**: 管理者権限（WinDivert ドライバロード用）
-- **Go 言語**: Go 1.21 以上（CGO 不要、標準コンパイラのみでビルド可能）
+| 項目 | Windows 版 | Ubuntu 版 |
+| :--- | :--- | :--- |
+| **OS** | Windows 10 / 11 / Server 2016 以降（64-bit） | Ubuntu 20.04 以降 / 任意の Linux |
+| **権限** | 管理者（Administrator） | sudo |
+| **追加ドライバ** | WinDivert.dll + WinDivert64.sys | 不要（iptables 使用） |
+| **Go バージョン** | Go 1.21 以上（CGO 不要） | Go 1.21 以上（CGO 不要） |
 
 ```powershell
-# リリース用最適化ビルド
-go build -v -ldflags="-s -w" -o tproxy.exe ./cmd/tproxy
+# Windows: リリースビルド
+go build -ldflags="-s -w" -o tproxy.exe ./cmd/tproxy
 
-# 全テストの実行
+# Ubuntu: リリースビルド
+go build -ldflags="-s -w" -o tproxy ./cmd/tproxy
+
+# テスト実行（共通）
 go test -count=1 ./...
 ```
