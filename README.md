@@ -180,7 +180,7 @@ export all_proxy=http://127.0.0.1:18080
 | `pac_url` | `string` | `""` | 上位プロキシの PAC/WPAD URL（例: `"http://wpad.corp.local/wpad.dat"`）。**※Windows版のみ対応（Ubuntu版では無視されます）** |
 | `upstream_proxy` | `string` | `""` | 固定上位 HTTP プロキシ URL（例: `"http://proxy.corp.local:8080"`） |
 | `bypass_sspi` | `bool` | `false` | `true` で上位プロキシへの Windows 統合認証（SSPI/NTLM）を無効化 |
-| `dns_servers` | `[]string` | `[]` | 上位 DNS サーバーの IP 一覧（例: GCP `["169.254.169.254"]`、AWS `["10.0.0.2"]`、社内 DNS `["192.168.1.1"]`）。指定時は平文直通バイパス。**未指定（空）の場合は自動で Cloudflare Security DoH（1.1.1.2 等）を使用** |
+| `dns_servers` | `[]string` | `[]` | 上位 DNS サーバーの IP 一覧（IPv4: `"192.168.1.1"`, `"169.254.169.254"`, IPv6: `"2001:db8::1"` 等）。指定時は平文 UDP 53 直通バイパス。<br>**未指定（`[]`）時は自動で Cloudflare Security DoH（IPv4: `1.1.1.2`, `1.0.0.2` / IPv6: `2606:4700:4700::1112`, `2606:4700:4700::1002`）で暗号化解決** |
 | `doh_timeout_sec` | `int` | `3` | DoH クエリのタイムアウト秒数 |
 | `fallback_to_udp` | `bool` | `true` | DoH 失敗時に平文 UDP 53 へフォールバックするかどうか |
 | `dns_cache_enabled` | `bool` | `true` | インメモリ DNS キャッシュ（2 回目以降 0 ms 応答）の有効/無効 |
@@ -250,10 +250,13 @@ export all_proxy=http://127.0.0.1:18080
 #### パターン 5: DNS 設定（社内/クラウド DNS 直通 vs デフォルト DoH）
 
 **A. 社内 DNS やクラウド仮想マシン（GCP / AWS 等）の場合（直通バイパス）**:
+IPv4 アドレス（`"169.254.169.254"`, `"10.0.0.2"`）、IPv6 アドレス（`"2001:db8::53"`）を直接指定します：
 ```json
 {
   "dns_servers": [
-    "169.254.169.254"
+    "169.254.169.254",
+    "10.0.0.2",
+    "2001:db8::53"
   ]
 }
 ```
