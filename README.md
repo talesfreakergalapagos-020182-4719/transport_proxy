@@ -169,7 +169,7 @@ export all_proxy=http://127.0.0.1:18080
 | `blocked_domains` | `[]string` | `[]` | **ブラックリスト**で遮断するドメイン・ワイルドカード |
 | `blocked_ips` | `[]string` | `[]` | **ブラックリスト**で遮断する IP / CIDR |
 | `listen_addr` | `string` | `"0.0.0.0:18080"` | ローカルプロキシの待受けアドレス（ポート衝突時は自動で別ポートへ退避） |
-| `pac_url` | `string` | `""` | 上位プロキシの PAC/WPAD URL（例: `"http://wpad.corp.local/wpad.dat"`） |
+| `pac_url` | `string` | `""` | 上位プロキシの PAC/WPAD URL（例: `"http://wpad.corp.local/wpad.dat"`）。**※Windows版のみ対応（Ubuntu版では無視されます）** |
 | `upstream_proxy` | `string` | `""` | 固定上位 HTTP プロキシ URL（例: `"http://proxy.corp.local:8080"`） |
 | `bypass_sspi` | `bool` | `false` | `true` で上位プロキシへの Windows 統合認証（SSPI/NTLM）を無効化 |
 | `doh_enabled` | `bool` | `true` | 平文 DNS（UDP 53）を DNS-over-HTTPS へ自動昇格する機能の有効/無効 |
@@ -178,7 +178,7 @@ export all_proxy=http://127.0.0.1:18080
 | `dns_cache_enabled` | `bool` | `true` | インメモリ DNS キャッシュ（2 回目以降 0 ms 応答）の有効/無効 |
 | `dns_cache_ttl_sec` | `int` | `300` | DNS キャッシュの最大保持秒数（TTL） |
 | `connect_timeout_sec` | `int` | `10` | 上流サーバー / 上位プロキシへの TCP 接続タイムアウト秒数 |
-| `idle_timeout_sec` | `int` | `120` | 無通信接続の切断秒数。`0` で無期限維持（RDP・SSH に推奨） |
+| `idle_timeout_sec` | `int` | `60` | 無通信接続の切断秒数。`0` で無期限維持（RDP・SSH に推奨） |
 | `reload_interval_sec` | `int` | `5` | 設定ファイルの変更検知周期（秒） |
 | `log_file` | `string` | `""` | ログ出力先ファイルパス。空文字はコンソールのみ |
 | `dry_run` | `bool` | `false` | `true` で通信を変更せず監査ログ出力のみのドライランモード |
@@ -237,7 +237,9 @@ export all_proxy=http://127.0.0.1:18080
 }
 ```
 
-> 上位プロキシが NTLM/SSO 認証を要求する場合、Windows サインイン資格情報で自動認証（パスワードレス）されます。
+> **注意 (Ubuntu版について)**: `pac_url` による PAC 解析は Windows 版の独自機能（WinHTTP API 利用）のため、**Ubuntu (Linux) 版では機能しません（指定しても無視され直接接続になります）**。Ubuntu で上位プロキシを利用する場合は、PAC は使わずに `"upstream_proxy"` で直接指定するか、OS の環境変数（`http_proxy` / `https_proxy`）を設定してください。
+>
+> 上位プロキシが NTLM/SSO 認証を要求する場合、Windows 版では Windows サインイン資格情報で自動認証（パスワードレス）されます。
 
 #### パターン 5: DNS-over-HTTPS（DoH）設定
 
@@ -250,6 +252,8 @@ export all_proxy=http://127.0.0.1:18080
   "dns_cache_ttl_sec": 300
 }
 ```
+
+> **Note**: `doh_enabled` が `true` の場合、社内や自宅のローカル DNS（プライベート IP アドレス）宛ての通信であっても、まずは DoH 通信（HTTPS）ができるかプローブ（確認）を行います。未対応の場合は即座に平文 UDP 53 にフォールバックするため、設定変更なしに安全に動作します。
 
 #### パターン 6: 常時接続維持（RDP・SSH 用）
 

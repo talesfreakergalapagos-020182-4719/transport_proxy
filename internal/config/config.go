@@ -31,7 +31,7 @@ type Config struct {
 	DryRun            bool     `json:"dry_run"`             // If true, run in passive monitoring/audit mode without intercepting traffic
 	LogFile           string   `json:"log_file"`            // Optional path to write log output (e.g. "tproxy.log")
 	ConnectTimeoutSec int      `json:"connect_timeout_sec"` // TCP connection timeout in seconds (default: 10)
-	IdleTimeoutSec    int      `json:"idle_timeout_sec"`    // TCP idle timeout in seconds (default: 120)
+	IdleTimeoutSec    int      `json:"idle_timeout_sec"`    // TCP idle timeout in seconds (default: 60)
 	ReloadIntervalSec int      `json:"reload_interval_sec"` // Interval in seconds to check for config file changes (default: 5)
 	DohEnabled        bool     `json:"doh_enabled"`         // If true, automatically upgrade DNS queries to DoH when target DNS supports IP-cert DoH (default: true)
 	DohTimeoutSec     int      `json:"doh_timeout_sec"`     // Timeout in seconds for DoH queries (default: 3)
@@ -81,7 +81,7 @@ func DefaultConfig() *Config {
 		DivertFilter:      "",
 		DryRun:            false,
 		ConnectTimeoutSec: 10,
-		IdleTimeoutSec:    120,
+		IdleTimeoutSec:    60,
 		ReloadIntervalSec: 5,
 		DohEnabled:        true,
 		DohTimeoutSec:     3,

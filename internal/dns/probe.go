@@ -28,8 +28,7 @@ type ProbeManager struct {
 	cache       sync.Map // map[string]*probeEntry
 	probeMu     sync.Map // map[string]*sync.Mutex for coalescing concurrent probes to same IP
 	cacheTTL    time.Duration
-	dohClient   *DoHClient
-	privateCIDR []*net.IPNet
+	dohClient      *DoHClient
 }
 
 // NewProbeManager creates a new DoH ProbeManager.
@@ -39,50 +38,15 @@ func NewProbeManager(dohClient *DoHClient, cacheTTL time.Duration) *ProbeManager
 	}
 
 	pm := &ProbeManager{
-		cacheTTL:  cacheTTL,
-		dohClient: dohClient,
-	}
-
-	// Initialize private and loopback networks to immediately skip probing
-	cidrList := []string{
-		"10.0.0.0/8",
-		"172.16.0.0/12",
-		"192.168.0.0/16",
-		"127.0.0.0/8",
-		"169.254.0.0/16",
-		"::1/128",
-		"fc00::/7",
-		"fe80::/10",
-	}
-
-	for _, cidr := range cidrList {
-		_, ipNet, err := net.ParseCIDR(cidr)
-		if err == nil {
-			pm.privateCIDR = append(pm.privateCIDR, ipNet)
-		}
+		cacheTTL:       cacheTTL,
+		dohClient:      dohClient,
 	}
 
 	return pm
 }
 
-// IsPrivateIP checks if the given IP belongs to private/link-local address spaces.
-func (pm *ProbeManager) IsPrivateIP(ip net.IP) bool {
-	if ip == nil || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsPrivate() {
-		return true
-	}
-	for _, cidr := range pm.privateCIDR {
-		if cidr.Contains(ip) {
-			return true
-		}
-	}
-	return false
-}
-
 // GetStatus returns the cached DoH status for an IP without performing a network probe.
 func (pm *ProbeManager) GetStatus(ip net.IP) DoHSupportStatus {
-	if pm.IsPrivateIP(ip) {
-		return StatusUnsupported
-	}
 
 	key := ip.String()
 	val, ok := pm.cache.Load(key)
@@ -101,9 +65,6 @@ func (pm *ProbeManager) GetStatus(ip net.IP) DoHSupportStatus {
 
 // CheckOrProbe checks cached status or sends a test DoH probe query to determine support.
 func (pm *ProbeManager) CheckOrProbe(ctx context.Context, ip net.IP) bool {
-	if pm.IsPrivateIP(ip) {
-		return false
-	}
 
 	status := pm.GetStatus(ip)
 	if status == StatusSupported {

@@ -130,31 +130,23 @@ func TestDNSCache(t *testing.T) {
 	}
 }
 
-func TestProbeManager_PrivateIP(t *testing.T) {
+func TestProbeManager_Cache(t *testing.T) {
 	client := NewDoHClient(1*time.Second, nil)
 	pm := NewProbeManager(client, 1*time.Hour)
 
-	privateIPs := []string{
-		"192.168.1.1",
-		"10.0.0.1",
-		"172.16.5.1",
-		"127.0.0.1",
-		"fe80::1",
+	ip := net.ParseIP("192.168.1.1")
+	if status := pm.GetStatus(ip); status != StatusUnknown {
+		t.Errorf("Expected initial status to be StatusUnknown, got %v", status)
 	}
 
-	for _, ipStr := range privateIPs {
-		ip := net.ParseIP(ipStr)
-		if !pm.IsPrivateIP(ip) {
-			t.Errorf("Expected %s to be recognized as private IP", ipStr)
-		}
-		if pm.CheckOrProbe(context.Background(), ip) {
-			t.Errorf("Expected private IP %s to return false (unsupported/passthrough)", ipStr)
-		}
+	// Probing non-responsive IP should result in unsupported (or false)
+	supported := pm.CheckOrProbe(context.Background(), ip)
+	if supported {
+		t.Errorf("Expected probe to unresolvable IP to return false")
 	}
 
-	publicIP := net.ParseIP("1.1.1.2")
-	if pm.IsPrivateIP(publicIP) {
-		t.Errorf("Public IP %s was incorrectly marked as private", publicIP)
+	if status := pm.GetStatus(ip); status != StatusUnsupported {
+		t.Errorf("Expected cached status to be StatusUnsupported, got %v", status)
 	}
 }
 
