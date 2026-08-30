@@ -106,17 +106,22 @@ sudo ./scripts/install-ubuntu.sh
 
 ### WSL2 での使い方
 
-WSL2 のネットワークをミラーモードに設定すれば、WSL2 上の通信は Windows ホストのネットワークスタックを共有するため、**WinDivert によって自動的に透過キャプチャ**されます。アプリ側のプロキシ設定は不要です。
+WSL2 上で Linux 版 `tproxy` を実行する場合、または Windows ホスト側の `tproxy` と連携する場合、WSL2 の DNS 設定（`dnsTunneling`）とネットワークモードを設定します。
 
-#### ① `.wslconfig` でミラーモードを有効化
+#### ① `.wslconfig` でミラーモードと DNS トンネリング無効化を設定
 
-`%UserProfile%\.wslconfig` に以下を追記します：
+`%UserProfile%\.wslconfig` に以下を設定します：
 
 ```ini
 [wsl2]
 networkingMode=mirrored
+dnsTunneling=false
 firewall=true
 ```
+
+> **💡 なぜ `dnsTunneling=false` が必要なのか？**:
+> `dnsTunneling=true`（WSL2 のデフォルト）の場合、DNS 問い合わせが Windows 側の内部プロキシ（`127.0.0.42`）へ直接渡されるため、`iptables` のローカル通信除外ルール（`127.0.0.0/8`）によって DoH 昇格をバイパスしてしまいます。
+> **`dnsTunneling=false`** に設定することで、WSL2 内の DNS クエリが外部宛て UDP 53 パケットとして送信され、`tproxy` の DoH 変換エンジン（ポート `:18180`）で確実にキャプチャ・DoH 昇格（Cloudflare Security 等）・インメモリキャッシュされるようになります。
 
 設定後、PowerShell で `wsl --shutdown` を実行して WSL を再起動します。これだけで WSL2 上の curl・apt・Docker 等の通信が設定不要で tproxy に制御されます。
 
