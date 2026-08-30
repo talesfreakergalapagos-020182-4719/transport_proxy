@@ -180,8 +180,7 @@ export all_proxy=http://127.0.0.1:18080
 | `pac_url` | `string` | `""` | 上位プロキシの PAC/WPAD URL（例: `"http://wpad.corp.local/wpad.dat"`）。**※Windows版のみ対応（Ubuntu版では無視されます）** |
 | `upstream_proxy` | `string` | `""` | 固定上位 HTTP プロキシ URL（例: `"http://proxy.corp.local:8080"`） |
 | `bypass_sspi` | `bool` | `false` | `true` で上位プロキシへの Windows 統合認証（SSPI/NTLM）を無効化 |
-| `dns_servers` | `[]string` | `[]` | 上位 DNS サーバーの IP 一覧（例: GCP `["169.254.169.254"]`、AWS `["10.0.0.2"]`、社内 DNS `["192.168.1.1"]`）。指定時は平文直通バイパス。**空の場合は自動で Cloudflare Security DoH（1.1.1.2 等）を使用** |
-| `doh_enabled` | `bool` | `true` | 平文 DNS（UDP 53）を DNS-over-HTTPS へ自動昇格する機能の有効/無効 |
+| `dns_servers` | `[]string` | `[]` | 上位 DNS サーバーの IP 一覧（例: GCP `["169.254.169.254"]`、AWS `["10.0.0.2"]`、社内 DNS `["192.168.1.1"]`）。指定時は平文直通バイパス。**未指定（空）の場合は自動で Cloudflare Security DoH（1.1.1.2 等）を使用** |
 | `doh_timeout_sec` | `int` | `3` | DoH クエリのタイムアウト秒数 |
 | `fallback_to_udp` | `bool` | `true` | DoH 失敗時に平文 UDP 53 へフォールバックするかどうか |
 | `dns_cache_enabled` | `bool` | `true` | インメモリ DNS キャッシュ（2 回目以降 0 ms 応答）の有効/無効 |
@@ -248,21 +247,25 @@ export all_proxy=http://127.0.0.1:18080
 
 > **注意 (Ubuntu版について)**: `pac_url` による PAC 解析は Windows 版の独自機能（WinHTTP API 利用）のため、**Ubuntu (Linux) 版では機能しません（指定しても無視され直接接続になります）**。Ubuntu で上位プロキシを利用する場合は、PAC は使わずに `"upstream_proxy"` で直接指定するか、OS の環境変数（`http_proxy` / `https_proxy`）を設定してください。
 >
-> 上位プロキシが NTLM/SSO 認証を要求する場合、Windows 版では Windows サインイン資格情報で自動認証（パスワードレス）されます。
+#### パターン 5: DNS 設定（社内/クラウド DNS 直通 vs デフォルト DoH）
 
-#### パターン 5: DNS-over-HTTPS（DoH）設定
-
+**A. 社内 DNS やクラウド仮想マシン（GCP / AWS 等）の場合（直通バイパス）**:
 ```json
 {
-  "doh_enabled": true,
-  "doh_timeout_sec": 3,
-  "fallback_to_udp": true,
-  "dns_cache_enabled": true,
-  "dns_cache_ttl_sec": 300
+  "dns_servers": [
+    "169.254.169.254"
+  ]
 }
 ```
+> 社内 DNS（`10.x.x.x`）や GCP メタデータ DNS（`169.254.169.254`）、AWS VPC DNS（`10.0.0.2`）を指定すると、そのサーバー宛ての平文 UDP 53 通信が直接バイパスされ、社内ドメイン（`*.corp`）やクラウド内部ドメイン（`*.internal`）が 100% 安定して解決されます。
 
-> **Note**: `doh_enabled` が `true` の場合、社内や自宅のローカル DNS（プライベート IP アドレス）宛ての通信であっても、まずは DoH 通信（HTTPS）ができるかプローブ（確認）を行います。未対応の場合は即座に平文 UDP 53 にフォールバックするため、設定変更なしに安全に動作します。
+**B. 一般インターネット環境の場合（自動 DoH 暗号化）**:
+```json
+{
+  "dns_servers": []
+}
+```
+> `dns_servers` を空配列 `[]` または未指定にすると、**Cloudflare Security DNS (`1.1.1.2`, `1.0.0.2`, `2606:4700:4700::1112`, `2606:4700:4700::1002`)** を使用し、自動的に **DoH（HTTPS 暗号化）** に変換して送信されます（マルウェア・フィッシング自動遮断）。
 
 #### パターン 6: 常時接続維持（RDP・SSH 用）
 

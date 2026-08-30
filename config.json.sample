@@ -1,8 +1,5 @@
 {
-  "dns_servers": [
-    "169.254.169.254"
-  ],
-  "doh_enabled": true,
+  "dns_servers": [],
   "log_file": "",
   "pac_url": "http://proxy.corp.local/proxy.pac",
   "upstream_proxy": "",
