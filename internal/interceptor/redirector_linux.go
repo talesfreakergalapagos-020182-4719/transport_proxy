@@ -106,7 +106,7 @@ func (r *Redirector) Start(ctx context.Context) error {
 
 	// 1. Start local UDP listener for default Cloudflare DoH interception when no custom DNS is configured
 	if len(r.dnsServers) == 0 && r.dnsEng != nil {
-		dnsAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("127.0.0.1:%d", r.localDNSUDPPort))
+		dnsAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf(":%d", r.localDNSUDPPort))
 		if err != nil {
 			return fmt.Errorf("failed to resolve local DNS UDP address: %w", err)
 		}
@@ -121,7 +121,7 @@ func (r *Redirector) Start(ctx context.Context) error {
 
 		r.dnsUDPConn = conn
 		go r.dnsListenerLoop(ctx)
-		log.Printf("[Redirector] DNS UDP Interceptor listening on 127.0.0.1:%d (Cloudflare Security DoH mode)", r.localDNSUDPPort)
+		log.Printf("[Redirector] DNS UDP Interceptor listening on :%d (Cloudflare Security DoH mode)", r.localDNSUDPPort)
 	}
 
 	// 2. Apply iptables redirection rules
