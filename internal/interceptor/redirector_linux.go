@@ -316,7 +316,7 @@ func (r *Redirector) dnsListenerLoop(ctx context.Context, conn *net.UDPConn) {
 		default:
 		}
 
-		n, _, _, clientAddr, err := r.dnsUDPConn.ReadMsgUDP(buf, oob)
+		n, _, _, clientAddr, err := conn.ReadMsgUDP(buf, oob)
 		if err != nil {
 			r.mu.Lock()
 			isClosed := r.closed
