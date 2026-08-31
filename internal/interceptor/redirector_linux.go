@@ -402,13 +402,17 @@ func (r *Redirector) applyIPTablesRules() error {
 		return fmt.Errorf("failed to add TCP redirect rule: %w", err)
 	}
 
-	// Link to OUTPUT chain only (intercepts outbound traffic initiated from this host; does NOT touch inbound traffic)
+	// Link to OUTPUT chain (intercepts outbound traffic initiated from this host)
 	if err := execCmd("iptables", "-t", "nat", "-A", "OUTPUT", "-p", "tcp", "-j", iptablesChainName); err != nil {
 		return fmt.Errorf("failed to hook into OUTPUT chain: %w", err)
 	}
 
+	// Link to PREROUTING chain (intercepts forwarded traffic, e.g., from Docker containers)
+	_ = execCmd("iptables", "-t", "nat", "-A", "PREROUTING", "-p", "tcp", "-j", iptablesChainName)
+
 	if !isCustomDNS && r.dnsEng != nil {
 		_ = execCmd("iptables", "-t", "nat", "-A", "OUTPUT", "-p", "udp", "--dport", "53", "-j", iptablesChainName)
+		_ = execCmd("iptables", "-t", "nat", "-A", "PREROUTING", "-p", "udp", "--dport", "53", "-j", iptablesChainName)
 	}
 
 	// -------------------------------------------------------------
@@ -437,9 +441,11 @@ func (r *Redirector) applyIPTablesRules() error {
 		_ = execCmd("ip6tables", "-t", "nat", "-A", iptablesChainName, "-p", "tcp", "-j", "REDIRECT", "--to-ports", proxyPortStr)
 
 		_ = execCmd("ip6tables", "-t", "nat", "-A", "OUTPUT", "-p", "tcp", "-j", iptablesChainName)
+		_ = execCmd("ip6tables", "-t", "nat", "-A", "PREROUTING", "-p", "tcp", "-j", iptablesChainName)
 
 		if !isCustomDNS && r.dnsEng != nil {
 			_ = execCmd("ip6tables", "-t", "nat", "-A", "OUTPUT", "-p", "udp", "--dport", "53", "-j", iptablesChainName)
+			_ = execCmd("ip6tables", "-t", "nat", "-A", "PREROUTING", "-p", "udp", "--dport", "53", "-j", iptablesChainName)
 		}
 	}
 

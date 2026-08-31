@@ -158,9 +158,9 @@ func (r *Redirector) Start(ctx context.Context) error {
 	r.handle = handle
 
 	// Optimize kernel packet queue for high-throughput and spike resilience
-	_ = r.dll.SetParam(handle, WINDIVERT_PARAM_QUEUE_LENGTH, 8192)
-	_ = r.dll.SetParam(handle, WINDIVERT_PARAM_QUEUE_TIME, 2000)
-	_ = r.dll.SetParam(handle, WINDIVERT_PARAM_QUEUE_SIZE, 32*1024*1024)
+	_ = r.dll.SetParam(handle, WINDIVERT_PARAM_QUEUE_LENGTH, 16384)
+	_ = r.dll.SetParam(handle, WINDIVERT_PARAM_QUEUE_TIME, 8000)
+	_ = r.dll.SetParam(handle, WINDIVERT_PARAM_QUEUE_SIZE, 64*1024*1024)
 
 	log.Printf("[Redirector] WinDivert Network Layer (Layer 0) started with filter: %s", r.filterStr)
 
@@ -561,11 +561,28 @@ func (r *Redirector) packetLoop(ctx context.Context, workerID int) {
 									addr.Flags |= WINDIVERT_ADDRESS_FLAG_IMPOSTOR            // Mark as injected packet
 									_ = r.dll.CalcChecksums(rawPacket, &addr, 0)
 
-									sentLen, sendErr := r.dll.Send(r.handle, rawPacket, &addr)
-									if sendErr != nil {
-										logger.Debugf("[RNAT-v6] Send failed (len=%d): %v", len(rawPacket), sendErr)
+									if len(rawPacket) > 1280 {
+										sentLen, sendErr := r.dll.Send(r.handle, rawPacket, &addr)
+										if sendErr != nil {
+											fragments := FragmentIPv6TCP(rawPacket, 1280)
+											for i, frag := range fragments {
+												sLen, sErr := r.dll.Send(r.handle, frag, &addr)
+												if sErr != nil {
+													logger.Debugf("[RNAT-v6] Send failed: frag %d/%d (len=%d): %v", i+1, len(fragments), len(frag), sErr)
+												} else {
+													logger.Debugf("[RNAT-v6] Sent frag %d/%d (len=%d, sentLen=%d, IfIdx=%d)", i+1, len(fragments), len(frag), sLen, addr.IfIdx)
+												}
+											}
+										} else {
+											logger.Debugf("[RNAT-v6] Sent len=%d, sentLen=%d, IfIdx=%d", len(rawPacket), sentLen, addr.IfIdx)
+										}
 									} else {
-										logger.Debugf("[RNAT-v6] Sent len=%d, sentLen=%d, IfIdx=%d", len(rawPacket), sentLen, addr.IfIdx)
+										sentLen, sendErr := r.dll.Send(r.handle, rawPacket, &addr)
+										if sendErr != nil {
+											logger.Debugf("[RNAT-v6] Send failed (len=%d): %v", len(rawPacket), sendErr)
+										} else {
+											logger.Debugf("[RNAT-v6] Sent len=%d, sentLen=%d, IfIdx=%d", len(rawPacket), sentLen, addr.IfIdx)
+										}
 									}
 									continue
 								} else {

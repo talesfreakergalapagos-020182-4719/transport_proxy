@@ -692,6 +692,99 @@ func FragmentIPv4(packet []byte, mtu int) [][]byte {
 	return fragments
 }
 
+// FragmentIPv6TCP segments a large IPv6 TCP packet (LSO) into multiple smaller TCP segments
+// to fit within the specified MTU (e.g. 1280). It recalculates TCP checksums for each segment.
+func FragmentIPv6TCP(packet []byte, mtu int) [][]byte {
+	if len(packet) < 60 { // Minimum IPv6 + TCP
+		return [][]byte{packet}
+	}
+	version := packet[0] >> 4
+	if version != 6 || packet[6] != IPPROTO_TCP {
+		return [][]byte{packet} // Only handle IPv6 TCP
+	}
+
+	const ip6HdrLen = 40
+	tcpOffset := ip6HdrLen
+	dataOffset := int((packet[tcpOffset+12] >> 4) * 4)
+	tcpHdrLen := dataOffset
+	totalHdrLen := ip6HdrLen + tcpHdrLen
+
+	if len(packet) <= mtu || totalHdrLen >= len(packet) || tcpHdrLen < 20 {
+		return [][]byte{packet}
+	}
+
+	payload := packet[totalHdrLen:]
+	maxPayload := mtu - totalHdrLen
+	if maxPayload <= 0 {
+		return [][]byte{packet}
+	}
+
+	var fragments [][]byte
+	baseSeq := binary.BigEndian.Uint32(packet[tcpOffset+4 : tcpOffset+8])
+	origFlags := packet[tcpOffset+13]
+
+	for offset := 0; offset < len(payload); offset += maxPayload {
+		end := offset + maxPayload
+		if end > len(payload) {
+			end = len(payload)
+		}
+		chunkSize := end - offset
+
+		frag := make([]byte, totalHdrLen+chunkSize)
+		copy(frag[:totalHdrLen], packet[:totalHdrLen])
+		copy(frag[totalHdrLen:], payload[offset:end])
+
+		// Update IPv6 Payload Length (TCP Header + Payload)
+		binary.BigEndian.PutUint16(frag[4:6], uint16(tcpHdrLen+chunkSize))
+
+		// Update TCP Sequence Number
+		binary.BigEndian.PutUint32(frag[tcpOffset+4:tcpOffset+8], baseSeq+uint32(offset))
+
+		// Adjust TCP flags: clear PSH and FIN unless it's the last segment
+		if end < len(payload) {
+			frag[tcpOffset+13] = origFlags &^ (TCP_PSH | TCP_FIN)
+		}
+
+		// Recalculate TCP Checksum
+		frag[tcpOffset+16] = 0
+		frag[tcpOffset+17] = 0
+		csum := CalculateTCPChecksumIPv6(frag[8:24], frag[24:40], frag[tcpOffset:])
+		binary.BigEndian.PutUint16(frag[tcpOffset+16:tcpOffset+18], csum)
+
+		fragments = append(fragments, frag)
+	}
+
+	return fragments
+}
+
+// CalculateTCPChecksumIPv6 calculates the TCP checksum for an IPv6 TCP packet.
+func CalculateTCPChecksumIPv6(srcIP, dstIP, tcpSegment []byte) uint16 {
+	var csum uint32
+	// Pseudo-header
+	for i := 0; i < 16; i += 2 {
+		csum += uint32(srcIP[i])<<8 | uint32(srcIP[i+1])
+		csum += uint32(dstIP[i])<<8 | uint32(dstIP[i+1])
+	}
+	tcpLen := uint32(len(tcpSegment))
+	csum += tcpLen >> 16
+	csum += tcpLen & 0xffff
+	csum += uint32(IPPROTO_TCP)
+
+	// TCP Segment
+	for i := 0; i < len(tcpSegment)-1; i += 2 {
+		csum += uint32(tcpSegment[i])<<8 | uint32(tcpSegment[i+1])
+	}
+	if len(tcpSegment)%2 != 0 {
+		csum += uint32(tcpSegment[len(tcpSegment)-1]) << 8
+	}
+
+	for csum > 0xffff {
+		csum = (csum >> 16) + (csum & 0xffff)
+	}
+	return ^uint16(csum)
+}
+
+
 // ParseUDPFast parses a UDP header at offset 'ihl'.
 func ParseUDPFast(packet []byte, ihl int) (srcPort, dstPort, udpLen uint16, dataOffset int, err error) {
 	if len(packet) < ihl+8 {

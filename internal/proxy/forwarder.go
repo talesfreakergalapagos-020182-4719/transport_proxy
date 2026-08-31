@@ -17,7 +17,7 @@ import (
 
 var bufferPool = sync.Pool{
 	New: func() any {
-		b := make([]byte, 128*1024)
+		b := make([]byte, 256*1024)
 		return &b
 	},
 }
@@ -173,6 +173,9 @@ func PipeConnEx(c1 net.Conn, c2 net.Conn, clientPreBuffered io.Reader, upstreamP
 	c1AddrStr := c1.RemoteAddr().String()
 	c2AddrStr := c2.RemoteAddr().String()
 
+	var lastActivity atomic.Int64
+	lastActivity.Store(time.Now().UnixNano())
+
 	// 1. Upstream -> Client (c2 -> c1)
 	go func() {
 		var localBytes int64
@@ -203,16 +206,16 @@ func PipeConnEx(c1 net.Conn, c2 net.Conn, clientPreBuffered io.Reader, upstreamP
 		firstRead := true
 		
 		var lastDeadline time.Time
-		updateDeadline := func() {
+		updateDeadline := func(nowNano int64) {
 			if idleTimeout > 0 {
-				now := time.Now()
+				now := time.Unix(0, nowNano)
 				if now.Sub(lastDeadline) > deadlineRefreshInterval {
 					_ = c2.SetReadDeadline(now.Add(idleTimeout))
 					lastDeadline = now
 				}
 			}
 		}
-		updateDeadline()
+		updateDeadline(time.Now().UnixNano())
 
 		for {
 			if firstRead {
@@ -224,7 +227,9 @@ func PipeConnEx(c1 net.Conn, c2 net.Conn, clientPreBuffered io.Reader, upstreamP
 				firstRead = false
 			}
 			if nr > 0 {
-				updateDeadline()
+				now := time.Now().UnixNano()
+				lastActivity.Store(now)
+				updateDeadline(now)
 				if logger.IsVerbose() { logger.Debugf("[PIPE-DOWN] Received %d bytes from upstream %s -> Writing to client %s", nr, c2AddrStr, c1AddrStr) }
 				nw, ew := c1.Write(buf[0:nr])
 				if nw > 0 {
@@ -245,7 +250,14 @@ func PipeConnEx(c1 net.Conn, c2 net.Conn, clientPreBuffered io.Reader, upstreamP
 			}
 			if er != nil {
 				if logger.IsVerbose() { logger.Debugf("[PIPE-DOWN] Upstream read ended (c2=%s): %v", c2AddrStr, er) }
-				if er == io.EOF {
+				if netErr, ok := er.(net.Error); ok && netErr.Timeout() {
+					elapsed := time.Duration(time.Now().UnixNano() - lastActivity.Load())
+					if elapsed < idleTimeout {
+						updateDeadline(time.Now().UnixNano())
+						continue
+					}
+					closeWrite(c1)
+				} else if er == io.EOF {
 					closeWrite(c1)
 				} else {
 					_ = c1.Close()
@@ -285,21 +297,23 @@ func PipeConnEx(c1 net.Conn, c2 net.Conn, clientPreBuffered io.Reader, upstreamP
 		if logger.IsVerbose() { logger.Debugf("[PIPE-UP] Started: Client (%s) -> Upstream (%s)", c1AddrStr, c2AddrStr) }
 		
 		var lastDeadline time.Time
-		updateDeadline := func() {
+		updateDeadline := func(nowNano int64) {
 			if idleTimeout > 0 {
-				now := time.Now()
+				now := time.Unix(0, nowNano)
 				if now.Sub(lastDeadline) > deadlineRefreshInterval {
 					_ = c1.SetReadDeadline(now.Add(idleTimeout))
 					lastDeadline = now
 				}
 			}
 		}
-		updateDeadline()
+		updateDeadline(time.Now().UnixNano())
 
 		for {
 			nr, er := clientSrc.Read(buf)
 			if nr > 0 {
-				updateDeadline()
+				now := time.Now().UnixNano()
+				lastActivity.Store(now)
+				updateDeadline(now)
 				if logger.IsVerbose() { logger.Debugf("[PIPE-UP] Received %d bytes from client %s -> Forwarding to upstream %s", nr, c1AddrStr, c2AddrStr) }
 				nw, ew := c2.Write(buf[0:nr])
 				if nw > 0 {
@@ -320,7 +334,14 @@ func PipeConnEx(c1 net.Conn, c2 net.Conn, clientPreBuffered io.Reader, upstreamP
 			}
 			if er != nil {
 				if logger.IsVerbose() { logger.Debugf("[PIPE-UP] Client read ended (c1=%s): %v", c1AddrStr, er) }
-				if er == io.EOF {
+				if netErr, ok := er.(net.Error); ok && netErr.Timeout() {
+					elapsed := time.Duration(time.Now().UnixNano() - lastActivity.Load())
+					if elapsed < idleTimeout {
+						updateDeadline(time.Now().UnixNano())
+						continue
+					}
+					closeWrite(c2)
+				} else if er == io.EOF {
 					closeWrite(c2)
 				} else {
 					_ = c1.Close()

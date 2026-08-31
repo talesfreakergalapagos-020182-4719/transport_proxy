@@ -16,6 +16,18 @@ const (
 	IPPROTO_UDP  = 17
 )
 
+// TCP Flags
+const (
+	TCP_FIN = 1 << 0
+	TCP_SYN = 1 << 1
+	TCP_RST = 1 << 2
+	TCP_PSH = 1 << 3
+	TCP_ACK = 1 << 4
+	TCP_URG = 1 << 5
+	TCP_ECE = 1 << 6
+	TCP_CWR = 1 << 7
+)
+
 var (
 	ErrPacketTooShort      = errors.New("packet is too short")
 	ErrInvalidHeaderLength = errors.New("invalid header length")
