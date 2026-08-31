@@ -36,6 +36,7 @@ type Redirector struct {
 	dnsEng          DNSEvaluator
 	dnsServers      []string
 	dnsUDPConn      *net.UDPConn
+	dnsUDPConn2     *net.UDPConn
 	uid             int
 	rulesApplied    bool
 	mu              sync.Mutex
@@ -106,28 +107,46 @@ func (r *Redirector) Start(ctx context.Context) error {
 
 	// 1. Start local UDP listener for default Cloudflare DoH interception when no custom DNS is configured
 	if len(r.dnsServers) == 0 && r.dnsEng != nil {
-		dnsAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf(":%d", r.localDNSUDPPort))
+		// Listener 1: For host queries (OUTPUT chain), bound to 127.0.0.1:port
+		dnsAddr1, err := net.ResolveUDPAddr("udp", fmt.Sprintf("127.0.0.1:%d", r.localDNSUDPPort))
 		if err != nil {
-			return fmt.Errorf("failed to resolve local DNS UDP address: %w", err)
+			return fmt.Errorf("failed to resolve local DNS UDP address 1: %w", err)
 		}
-		conn, err := net.ListenUDP("udp", dnsAddr)
+		conn1, err := net.ListenUDP("udp", dnsAddr1)
 		if err != nil {
 			return fmt.Errorf("failed to listen on local DNS UDP port %d: %w", r.localDNSUDPPort, err)
 		}
-		
-		if err := setupUDPSocketOptions(conn); err != nil {
-			log.Printf("[Redirector] Warning: Failed to set UDP original destination socket options: %v", err)
+		if err := setupUDPSocketOptions(conn1); err != nil {
+			log.Printf("[Redirector] Warning: Failed to set UDP socket options: %v", err)
 		}
+		r.dnsUDPConn = conn1
+		go r.dnsListenerLoop(ctx, conn1)
 
-		r.dnsUDPConn = conn
-		go r.dnsListenerLoop(ctx)
-		log.Printf("[Redirector] DNS UDP Interceptor listening on :%d (Cloudflare Security DoH mode)", r.localDNSUDPPort)
+		// Listener 2: For Docker/forwarded queries (PREROUTING chain), bound to 0.0.0.0:port+1
+		dnsAddr2, err := net.ResolveUDPAddr("udp", fmt.Sprintf(":%d", r.localDNSUDPPort+1))
+		if err != nil {
+			return fmt.Errorf("failed to resolve local DNS UDP address 2: %w", err)
+		}
+		conn2, err := net.ListenUDP("udp", dnsAddr2)
+		if err != nil {
+			return fmt.Errorf("failed to listen on local DNS UDP port %d: %w", r.localDNSUDPPort+1, err)
+		}
+		if err := setupUDPSocketOptions(conn2); err != nil {
+			log.Printf("[Redirector] Warning: Failed to set UDP socket options: %v", err)
+		}
+		r.dnsUDPConn2 = conn2
+		go r.dnsListenerLoop(ctx, conn2)
+
+		log.Printf("[Redirector] DNS UDP Interceptor listening on 127.0.0.1:%d (Host) and :%d (Docker)", r.localDNSUDPPort, r.localDNSUDPPort+1)
 	}
 
 	// 2. Apply iptables redirection rules
 	if err := r.applyIPTablesRules(); err != nil {
 		if r.dnsUDPConn != nil {
 			_ = r.dnsUDPConn.Close()
+		}
+		if r.dnsUDPConn2 != nil {
+			_ = r.dnsUDPConn2.Close()
 		}
 		return fmt.Errorf("failed to configure iptables rules: %w", err)
 	}
@@ -156,6 +175,9 @@ func (r *Redirector) Close() error {
 
 	if r.dnsUDPConn != nil {
 		_ = r.dnsUDPConn.Close()
+	}
+	if r.dnsUDPConn2 != nil {
+		_ = r.dnsUDPConn2.Close()
 	}
 
 	if r.rulesApplied {
@@ -280,7 +302,7 @@ func extractOrigDstIP(oob []byte) net.IP {
 	return nil
 }
 
-func (r *Redirector) dnsListenerLoop(ctx context.Context) {
+func (r *Redirector) dnsListenerLoop(ctx context.Context, conn *net.UDPConn) {
 	buf := make([]byte, 4096)
 	oob := make([]byte, 2048)
 
@@ -317,7 +339,7 @@ func (r *Redirector) dnsListenerLoop(ctx context.Context) {
 				respData = r.forwardUDPQuery(ctx, defaultTargetIP, 53, qData)
 			}
 			if len(respData) > 0 {
-				_, _ = r.dnsUDPConn.WriteTo(respData, cAddr)
+				_, _ = conn.WriteTo(respData, cAddr)
 			}
 		}(clientAddr, queryData)
 	}
@@ -411,8 +433,9 @@ func (r *Redirector) applyIPTablesRules() error {
 	_ = execCmd("iptables", "-t", "nat", "-A", "PREROUTING", "-p", "tcp", "-j", iptablesChainName)
 
 	if !isCustomDNS && r.dnsEng != nil {
+		dnsPort2Str := strconv.Itoa(int(r.localDNSUDPPort + 1))
 		_ = execCmd("iptables", "-t", "nat", "-A", "OUTPUT", "-p", "udp", "--dport", "53", "-j", iptablesChainName)
-		_ = execCmd("iptables", "-t", "nat", "-A", "PREROUTING", "-p", "udp", "--dport", "53", "-j", iptablesChainName)
+		_ = execCmd("iptables", "-t", "nat", "-A", "PREROUTING", "-p", "udp", "--dport", "53", "-j", "REDIRECT", "--to-ports", dnsPort2Str)
 	}
 
 	// -------------------------------------------------------------
@@ -444,8 +467,9 @@ func (r *Redirector) applyIPTablesRules() error {
 		_ = execCmd("ip6tables", "-t", "nat", "-A", "PREROUTING", "-p", "tcp", "-j", iptablesChainName)
 
 		if !isCustomDNS && r.dnsEng != nil {
+			dnsPort2Str := strconv.Itoa(int(r.localDNSUDPPort + 1))
 			_ = execCmd("ip6tables", "-t", "nat", "-A", "OUTPUT", "-p", "udp", "--dport", "53", "-j", iptablesChainName)
-			_ = execCmd("ip6tables", "-t", "nat", "-A", "PREROUTING", "-p", "udp", "--dport", "53", "-j", iptablesChainName)
+			_ = execCmd("ip6tables", "-t", "nat", "-A", "PREROUTING", "-p", "udp", "--dport", "53", "-j", "REDIRECT", "--to-ports", dnsPort2Str)
 		}
 	}
 
