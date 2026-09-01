@@ -214,7 +214,7 @@ func main() {
 		if proxyListener != nil {
 			_ = proxyListener.Close()
 		}
-		log.Fatalf("[FATAL] Failed to initialize WinDivert redirector: %v", err)
+		log.Fatalf("[FATAL] Failed to initialize network redirector: %v", err)
 	}
 	redirector.SetDryRun(isDryRun, forwardCond, filterEng, pacResolver)
 	redirector.SetDNSServers(cfg.DNSServers)
@@ -232,7 +232,7 @@ func main() {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("[CRITICAL PANIC] Main process recovered from panic: %v", r)
-			log.Printf("[Cleanup] Forcing WinDivert handle cleanup to restore network state...")
+			log.Printf("[Cleanup] Forcing redirector handle cleanup to restore network state...")
 			_ = redirector.Close()
 			os.Exit(1)
 		}
@@ -252,12 +252,12 @@ func main() {
 		}
 	}
 
-	// Start WinDivert Packet Interceptor
+	// Start Network Packet Interceptor
 	if err := redirector.Start(ctx); err != nil {
 		if !isDryRun {
 			_ = proxyServer.Close()
 		}
-		log.Fatalf("[FATAL] Failed to start WinDivert interceptor: %v", err)
+		log.Fatalf("[FATAL] Failed to start network interceptor: %v", err)
 	}
 
 	// Start PortGuard to monitor reserved proxy outbound port range (40000-48999) for suspicious external apps
@@ -282,11 +282,11 @@ func main() {
 	// Step 1: Immediately cancel context to stop packet loop
 	cancel()
 
-	// Step 2: Close WinDivert handle to restore OS network routing instantly
+	// Step 2: Close redirector handle to restore OS network routing instantly
 	if err := redirector.Close(); err != nil {
-		log.Printf("[Shutdown] WinDivert close error: %v", err)
+		log.Printf("[Shutdown] Redirector close error: %v", err)
 	} else {
-		log.Printf("[Shutdown] WinDivert closed successfully. Network routing restored to standard OS path.")
+		log.Printf("[Shutdown] Redirector closed successfully. Network routing restored to standard OS path.")
 	}
 
 	// Step 3: Close local proxy listener and drain active connections
