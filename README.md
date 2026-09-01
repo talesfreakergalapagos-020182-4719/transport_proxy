@@ -384,7 +384,7 @@ Ubuntu 版は Linux 標準の **Netfilter** (`iptables`) を使い、ローカ�
 | **起動権限** | 管理者（Administrator）必須 | sudo 必須 |
 | **終了時のクリーンアップ** | WinDivert ドライバ自動アンロード | iptables / ip6tables ルール自動削除 |
 | **上位プロキシ認証** | SSPI / NTLM / Kerberos（Windows SSO）対応 | 基本認証のみ（SSPI 非対応） |
-| **常駐サービス化** | Windows サービス（予定） | `systemd` スクリプト付属 |
+| **常駐サービス化** | 非対応（手動起動） | `systemd` スクリプト付属 |
 | **WSL2 との関係** | WSL2 の通信源として機能 | WSL2 自体が Ubuntu 版相当 |
 
 ---
