@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -297,12 +298,14 @@ func TestIntegration_ProtocolDispatchAndDirectRelay(t *testing.T) {
 	defer directConn.Close()
 
 	// Verify local port is in reserved range (40000-48999)
-	localTCPAddr, ok := directConn.LocalAddr().(*net.TCPAddr)
-	if !ok {
-		t.Fatalf("Expected *net.TCPAddr, got %T", directConn.LocalAddr())
-	}
-	if localTCPAddr.Port < 40000 || localTCPAddr.Port > 48999 {
-		t.Fatalf("Expected local port in 40000-48999, got %d", localTCPAddr.Port)
+	if runtime.GOOS == "windows" {
+		localTCPAddr, ok := directConn.LocalAddr().(*net.TCPAddr)
+		if !ok {
+			t.Fatalf("Expected *net.TCPAddr, got %T", directConn.LocalAddr())
+		}
+		if localTCPAddr.Port < 40000 || localTCPAddr.Port > 48999 {
+			t.Fatalf("Expected local port in 40000-48999, got %d", localTCPAddr.Port)
+		}
 	}
 
 	// Read greeting banner from direct connection
@@ -324,151 +327,160 @@ func TestIntegration_ProtocolDispatchAndDirectRelay(t *testing.T) {
 		t.Errorf("Expected 198.51.100.1 to be blocked in whitelist")
 	}
 
-	t.Logf("Protocol dispatch and DIRECT relay verified successfully: Outbound port %d in range, greeting received, IP filtering works.", localTCPAddr.Port)
+	t.Logf("Protocol dispatch and DIRECT relay verified successfully: Outbound port verification applied on Windows, greeting received, IP filtering works.")
 }
 
 func TestIntegration_SSPIProxyAuthentication(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("SSPI authentication is only supported natively on Windows")
+	}
 	if os.Getenv("CI") != "" {
 		t.Skip("Skipping SSPI test in CI")
 	}
 
-	// 1. Setup mock destination Web server (Target)
-	targetContent := "SECURE_AUTHENTICATED_CONTENT"
-	targetServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, targetContent)
-	}))
-	defer targetServer.Close()
+	// Test both NTLM and Negotiate (Kerberos/SPNEGO) corporate proxy authentication schemes
+	for _, authScheme := range []string{"NTLM", "Negotiate"} {
+		t.Run(authScheme, func(t *testing.T) {
+			// 1. Setup mock destination Web server (Target)
+			targetContent := "SECURE_AUTHENTICATED_CONTENT_" + authScheme
+			targetServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				fmt.Fprint(w, targetContent)
+			}))
+			defer targetServer.Close()
 
-	targetHostPort := strings.TrimPrefix(targetServer.URL, "http://")
+			targetHostPort := strings.TrimPrefix(targetServer.URL, "http://")
 
-	// 2. Setup mock upstream proxy with SSPI NTLM authentication
-	authStep := 0
-	var serverSSPI *sspi.ServerSSPIContext
-	proxyServerMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodConnect {
-			http.Error(w, "Only CONNECT supported", http.StatusBadRequest)
-			return
-		}
-
-		authHeader := r.Header.Get("Proxy-Authorization")
-		if authHeader == "" {
-			// Step 1: Challenge with NTLM
-			w.Header().Set("Proxy-Authenticate", "NTLM")
-			w.WriteHeader(http.StatusProxyAuthRequired)
-			return
-		}
-
-		parts := strings.Fields(authHeader)
-		if len(parts) >= 2 {
-			scheme := parts[0]
-			clientToken := parts[1]
-
-			if serverSSPI == nil {
-				sCtx, err := sspi.NewServerSSPIContext("NTLM")
-				if err != nil {
-					http.Error(w, err.Error(), http.StatusInternalServerError)
+			// 2. Setup mock upstream proxy with SSPI authentication (NTLM or Negotiate)
+			authStep := 0
+			var serverSSPI *sspi.ServerSSPIContext
+			proxyServerMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodConnect {
+					http.Error(w, "Only CONNECT supported", http.StatusBadRequest)
 					return
 				}
-				serverSSPI = sCtx
-			}
 
-			challengeToken, done, err := serverSSPI.AcceptStep(clientToken)
-			if err != nil {
-				http.Error(w, "SSPI error: "+err.Error(), http.StatusForbidden)
-				return
-			}
+				authHeader := r.Header.Get("Proxy-Authorization")
+				if authHeader == "" {
+					// Step 1: Challenge with specified scheme
+					w.Header().Set("Proxy-Authenticate", authScheme)
+					w.WriteHeader(http.StatusProxyAuthRequired)
+					return
+				}
 
-			if !done {
-				// Step 2: Send Type 2 Challenge
-				authStep = 1
-				w.Header().Set("Proxy-Authenticate", scheme+" "+challengeToken)
-				w.WriteHeader(http.StatusProxyAuthRequired)
-				return
-			}
+				parts := strings.Fields(authHeader)
+				if len(parts) >= 2 {
+					scheme := parts[0]
+					clientToken := parts[1]
 
-			// Step 3: Type 3 Authenticated!
-			authStep = 2
-			destConn, err := net.DialTimeout("tcp", r.Host, 2*time.Second)
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusServiceUnavailable)
-				return
-			}
-			hijacker, ok := w.(http.Hijacker)
-			if !ok {
-				http.Error(w, "Hijacking not supported", http.StatusInternalServerError)
-				return
-			}
-			clientConn, _, err := hijacker.Hijack()
-			if err != nil {
-				return
-			}
-			if _, err := clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
-				clientConn.Close()
-				destConn.Close()
-				return
-			}
-			go func() {
-				defer clientConn.Close()
-				defer destConn.Close()
-				go io.Copy(destConn, clientConn)
-				io.Copy(clientConn, destConn)
+					if serverSSPI == nil {
+						sCtx, err := sspi.NewServerSSPIContext(authScheme)
+						if err != nil {
+							http.Error(w, err.Error(), http.StatusInternalServerError)
+							return
+						}
+						serverSSPI = sCtx
+					}
+
+					challengeToken, done, err := serverSSPI.AcceptStep(clientToken)
+					if err != nil {
+						http.Error(w, "SSPI error: "+err.Error(), http.StatusForbidden)
+						return
+					}
+
+					if !done {
+						// Step 2: Send Challenge
+						authStep = 1
+						w.Header().Set("Proxy-Authenticate", scheme+" "+challengeToken)
+						w.WriteHeader(http.StatusProxyAuthRequired)
+						return
+					}
+
+					// Step 3: Authenticated!
+					authStep = 2
+					destConn, err := net.DialTimeout("tcp", r.Host, 2*time.Second)
+					if err != nil {
+						http.Error(w, err.Error(), http.StatusServiceUnavailable)
+						return
+					}
+					hijacker, ok := w.(http.Hijacker)
+					if !ok {
+						http.Error(w, "Hijacking not supported", http.StatusInternalServerError)
+						return
+					}
+					clientConn, _, err := hijacker.Hijack()
+					if err != nil {
+						return
+					}
+					if _, err := clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
+						clientConn.Close()
+						destConn.Close()
+						return
+					}
+					go func() {
+						defer clientConn.Close()
+						defer destConn.Close()
+						go io.Copy(destConn, clientConn)
+						io.Copy(clientConn, destConn)
+					}()
+					return
+				}
+
+				http.Error(w, "Authentication failed", http.StatusForbidden)
+			}))
+			defer func() {
+				if serverSSPI != nil {
+					serverSSPI.Release()
+				}
+				proxyServerMock.Close()
 			}()
-			return
-		}
 
-		http.Error(w, "Authentication failed", http.StatusForbidden)
-	}))
-	defer func() {
-		if serverSSPI != nil {
-			serverSSPI.Release()
-		}
-		proxyServerMock.Close()
-	}()
+			// 3. Dial through proxy using Forwarder (with SSPI enabled)
+			forwarder := NewForwarder(false, 5) // bypassSSPI = false
+			conn, preBuffered, err := forwarder.DialOutbound(targetHostPort, proxyServerMock.URL)
+			if err != nil {
+				if strings.Contains(err.Error(), "0x8009030E") || strings.Contains(err.Error(), "0x80090304") {
+					t.Skipf("Skipping SSPI test: Current session has no cached domain credentials: %v", err)
+					return
+				}
+				t.Fatalf("DialOutbound with SSPI failed: %v", err)
+			}
+			defer conn.Close()
 
-	// 3. Dial through proxy using Forwarder (with SSPI enabled)
-	forwarder := NewForwarder(false, 5) // bypassSSPI = false
-	conn, preBuffered, err := forwarder.DialOutbound(targetHostPort, proxyServerMock.URL)
-	if err != nil {
-		if strings.Contains(err.Error(), "0x8009030E") || strings.Contains(err.Error(), "0x80090304") {
-			t.Skipf("Skipping SSPI test: Current session has no cached domain credentials: %v", err)
-			return
-		}
-		t.Fatalf("DialOutbound with SSPI failed: %v", err)
+			if authStep != 2 {
+				t.Fatalf("Expected authStep=2 (completed SSO), got %d", authStep)
+			}
+
+			// 4. Send HTTP GET over the established tunnel
+			req := fmt.Sprintf("GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", targetHostPort)
+			if _, err := conn.Write([]byte(req)); err != nil {
+				t.Fatalf("Failed to write HTTP request over SSPI tunnel: %v", err)
+			}
+
+			var reader io.Reader = conn
+			if preBuffered != nil {
+				reader = io.MultiReader(preBuffered, conn)
+			}
+
+			resp, err := http.ReadResponse(bufio.NewReader(reader), &http.Request{Method: "GET"})
+			if err != nil {
+				t.Fatalf("Failed to read HTTP response over SSPI tunnel: %v", err)
+			}
+			defer resp.Body.Close()
+
+			bodyBytes, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatalf("Failed to read response body: %v", err)
+			}
+
+			if string(bodyBytes) != targetContent {
+				t.Fatalf("Expected body %q, got %q", targetContent, string(bodyBytes))
+			}
+
+			t.Logf("SSPI %s Proxy Authentication verified successfully: 407 challenge handled, SSO token negotiated, payload received.", authScheme)
+		})
 	}
-	defer conn.Close()
-
-	if authStep != 2 {
-		t.Fatalf("Expected authStep=2 (completed SSO), got %d", authStep)
-	}
-
-	// 4. Send HTTP GET over the established tunnel
-	req := fmt.Sprintf("GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", targetHostPort)
-	if _, err := conn.Write([]byte(req)); err != nil {
-		t.Fatalf("Failed to write HTTP request over SSPI tunnel: %v", err)
-	}
-
-	var reader io.Reader = conn
-	if preBuffered != nil {
-		reader = io.MultiReader(preBuffered, conn)
-	}
-
-	resp, err := http.ReadResponse(bufio.NewReader(reader), &http.Request{Method: "GET"})
-	if err != nil {
-		t.Fatalf("Failed to read HTTP response over SSPI tunnel: %v", err)
-	}
-	defer resp.Body.Close()
-
-	bodyBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatalf("Failed to read response body: %v", err)
-	}
-
-	if string(bodyBytes) != targetContent {
-		t.Fatalf("Expected body %q, got %q", targetContent, string(bodyBytes))
-	}
-
-	t.Logf("SSPI NTLM Proxy Authentication verified successfully: 407 challenge handled, SSO token negotiated, payload received.")
 }
+
 
 func TestIntegration_IPv6DirectRelay(t *testing.T) {
 	// 1. Start a mock IPv6 TCP server listening on [::1]
@@ -514,9 +526,11 @@ func TestIntegration_IPv6DirectRelay(t *testing.T) {
 	}
 
 	// Verify outbound port is in reserved range (40000-48999)
-	localTCPAddr := conn.LocalAddr().(*net.TCPAddr)
-	if localTCPAddr.Port < 40000 || localTCPAddr.Port > 48999 {
-		t.Errorf("Expected outbound IPv6 port in 40000-48999, got %d", localTCPAddr.Port)
+	if runtime.GOOS == "windows" {
+		localTCPAddr := conn.LocalAddr().(*net.TCPAddr)
+		if localTCPAddr.Port < 40000 || localTCPAddr.Port > 48999 {
+			t.Errorf("Expected outbound IPv6 port in 40000-48999, got %d", localTCPAddr.Port)
+		}
 	}
 
 	// Read server greeting
@@ -545,8 +559,7 @@ func TestIntegration_IPv6DirectRelay(t *testing.T) {
 		t.Errorf("Expected echo %q, got %q", expectedClientGreeting, string(echoBuf))
 	}
 
-	t.Logf("IPv6 Direct Relay test passed: Outbound port %d in range, greeting & echo verified on %s",
-		localTCPAddr.Port, serverAddr)
+	t.Logf("IPv6 Direct Relay test passed: Outbound port verification applied on Windows, greeting & echo verified on %s", serverAddr)
 }
 
 func TestServer_AcquireListener_Fallback(t *testing.T) {
@@ -731,4 +744,118 @@ func Test_isAuthorizedLocalClient(t *testing.T) {
 		t.Errorf("Expected external IP 198.51.100.99 to be rejected")
 	}
 }
+
+func TestIntegration_CorporateProxyScenarios(t *testing.T) {
+	// 1. Setup mock destination Web server
+	destContent := "CORPORATE_INTERNAL_DESTINATION_OK"
+	destServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, destContent)
+	}))
+	defer destServer.Close()
+
+	destHostPort := strings.TrimPrefix(destServer.URL, "http://")
+
+	t.Run("CorporateProxy_SuccessfulTunnel", func(t *testing.T) {
+		// Mock upstream corporate proxy server that accepts CONNECT and tunnels
+		corpProxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodConnect {
+				destConn, err := net.DialTimeout("tcp", r.Host, 2*time.Second)
+				if err != nil {
+					http.Error(w, err.Error(), http.StatusBadGateway)
+					return
+				}
+				hijacker, ok := w.(http.Hijacker)
+				if !ok {
+					http.Error(w, "Hijacking not supported", http.StatusInternalServerError)
+					return
+				}
+				clientConn, _, err := hijacker.Hijack()
+				if err != nil {
+					destConn.Close()
+					return
+				}
+				clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+				go func() {
+					defer clientConn.Close()
+					defer destConn.Close()
+					go io.Copy(destConn, clientConn)
+					io.Copy(clientConn, destConn)
+				}()
+				return
+			}
+			http.Error(w, "Only CONNECT supported", http.StatusBadRequest)
+		}))
+		defer corpProxy.Close()
+
+		fwd := NewForwarder(true, 5)
+		outConn, preBuffered, err := fwd.DialOutbound(destHostPort, corpProxy.URL)
+		if err != nil {
+			t.Fatalf("Failed to dial corporate proxy: %v", err)
+		}
+		defer outConn.Close()
+
+		// Send HTTP GET through the tunnel
+		req := fmt.Sprintf("GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", destHostPort)
+		if _, err := outConn.Write([]byte(req)); err != nil {
+			t.Fatalf("Failed to send request: %v", err)
+		}
+
+		var r io.Reader = outConn
+		if preBuffered != nil {
+			r = io.MultiReader(preBuffered, outConn)
+		}
+		resp, err := http.ReadResponse(bufio.NewReader(r), &http.Request{Method: "GET"})
+		if err != nil {
+			t.Fatalf("Failed to read response: %v", err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if string(body) != destContent {
+			t.Errorf("Expected response %q, got %q", destContent, string(body))
+		}
+	})
+
+	t.Run("CorporateProxy_AuthRequired407", func(t *testing.T) {
+		// Mock corporate proxy that returns 407 Proxy Authentication Required
+		corpProxy407 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Proxy-Authenticate", "Basic realm=\"Corporate Secure Proxy\"")
+			http.Error(w, "Proxy Authentication Required", http.StatusProxyAuthRequired)
+		}))
+		defer corpProxy407.Close()
+
+		fwd := NewForwarder(true, 5)
+		conn, _, err := fwd.DialOutbound(destHostPort, corpProxy407.URL)
+		if err == nil {
+			if conn != nil {
+				conn.Close()
+			}
+			t.Fatalf("Expected error on 407 response, got nil")
+		}
+		if !strings.Contains(err.Error(), "407") && !strings.Contains(err.Error(), "non-200") {
+			t.Errorf("Expected error to mention 407 or non-200, got: %v", err)
+		}
+	})
+
+	t.Run("CorporateProxy_BadGateway502", func(t *testing.T) {
+		// Mock corporate proxy that returns 502 Bad Gateway when destination is unreachable
+		corpProxy502 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "Bad Gateway", http.StatusBadGateway)
+		}))
+		defer corpProxy502.Close()
+
+		fwd := NewForwarder(true, 5)
+		conn, _, err := fwd.DialOutbound(destHostPort, corpProxy502.URL)
+		if err == nil {
+			if conn != nil {
+				conn.Close()
+			}
+			t.Fatalf("Expected error on 502 response, got nil")
+		}
+		if !strings.Contains(err.Error(), "502") && !strings.Contains(err.Error(), "non-200") {
+			t.Errorf("Expected error to mention 502 or non-200, got: %v", err)
+		}
+	})
+}
+
 

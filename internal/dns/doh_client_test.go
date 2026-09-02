@@ -1,0 +1,63 @@
+package dns
+
+import (
+	"context"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+)
+
+type mockTransport struct {
+	rt     http.RoundTripper
+	mockURL string
+}
+
+func (m *mockTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	req.URL.Scheme = "http"
+	req.URL.Host = m.mockURL
+	return m.rt.RoundTrip(req)
+}
+
+func TestDoHClient_QueryDoH_Success(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("expected POST method, got %s", r.Method)
+		}
+		dummyResp := []byte{0x00, 0x01, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00}
+		w.WriteHeader(http.StatusOK)
+		w.Write(dummyResp)
+	}))
+	defer ts.Close()
+
+	client := NewDoHClient(5*time.Second, nil)
+	client.client.Transport = &mockTransport{
+		rt:      http.DefaultTransport,
+		mockURL: ts.Listener.Addr().String(),
+	}
+
+	ctx := context.Background()
+	dstIP := net.ParseIP("1.1.1.1")
+	query := []byte{0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0x03, 'c', 'o', 'm', 0x00, 0x00, 0x01, 0x00, 0x01}
+	
+	resp, err := client.QueryDoH(ctx, dstIP, query)
+	if err != nil {
+		t.Fatalf("QueryDoH failed: %v", err)
+	}
+	if len(resp) < 12 {
+		t.Errorf("unexpected response length: %d", len(resp))
+	}
+}
+
+func TestBuildDoHURL(t *testing.T) {
+	ipv4 := net.ParseIP("1.1.1.1")
+	if url := BuildDoHURL(ipv4); url != "https://1.1.1.1/dns-query" {
+		t.Errorf("unexpected IPv4 DoH URL: %s", url)
+	}
+
+	ipv6 := net.ParseIP("2606:4700:4700::1111")
+	if url := BuildDoHURL(ipv6); url != "https://[2606:4700:4700::1111]/dns-query" {
+		t.Errorf("unexpected IPv6 DoH URL: %s", url)
+	}
+}

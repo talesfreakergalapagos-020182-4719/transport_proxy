@@ -265,7 +265,7 @@ func (m *Manager) loadFile(path string) (*Config, time.Time, error) {
 		cfg.ConnectTimeoutSec = 10
 	}
 	if cfg.IdleTimeoutSec < 0 {
-		cfg.IdleTimeoutSec = 120
+		cfg.IdleTimeoutSec = 60
 	}
 	if cfg.ReloadIntervalSec <= 0 {
 		cfg.ReloadIntervalSec = 5

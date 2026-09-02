@@ -109,3 +109,120 @@ func TestBuildDivertFilter(t *testing.T) {
 		t.Fatalf("Unbalanced parentheses in fullCustom filter: open=%d, close=%d (filter=%q)", openCount, closeCount, fullCustom)
 	}
 }
+
+func TestConfigManager_InvalidValuesHandled(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "invalid.json")
+	// JSON with negative timeouts and empty required strings
+	invalidJSON := `{
+		"connect_timeout_sec": -5,
+		"idle_timeout_sec": -10,
+		"reload_interval_sec": 0
+	}`
+	if err := os.WriteFile(cfgPath, []byte(invalidJSON), 0644); err != nil {
+		t.Fatalf("failed to write temp config: %v", err)
+	}
+
+	mgr, err := NewManager(cfgPath)
+	if err != nil {
+		t.Fatalf("failed to create config manager: %v", err)
+	}
+	defer mgr.Stop()
+	cfg := mgr.Get()
+
+	if cfg.ConnectTimeoutSec != 10 {
+		t.Errorf("expected negative connect timeout to fallback to 10, got %d", cfg.ConnectTimeoutSec)
+	}
+	if cfg.IdleTimeoutSec != 60 {
+		t.Errorf("expected negative idle timeout to fallback to 60, got %d", cfg.IdleTimeoutSec)
+	}
+	if cfg.ReloadIntervalSec != 5 {
+		t.Errorf("expected zero reload interval to fallback to 5, got %d", cfg.ReloadIntervalSec)
+	}
+}
+
+func TestConfigManager_NonExistentFile(t *testing.T) {
+	_, err := NewManager("does_not_exist.json")
+	if err == nil {
+		t.Error("expected error when loading non-existent config file, got nil")
+	}
+}
+
+func TestConfig_CorporateProxySettings(t *testing.T) {
+	tests := []struct {
+		name          string
+		jsonConfig    string
+		expectedProxy string
+		expectedPAC   string
+		expectedSSPI  bool
+	}{
+		{
+			name: "Standard HTTP Corporate Proxy",
+			jsonConfig: `{
+				"upstream_proxy": "http://proxy.corp.example.com:8080",
+				"pac_url": ""
+			}`,
+			expectedProxy: "http://proxy.corp.example.com:8080",
+			expectedPAC:   "",
+			expectedSSPI:  false,
+		},
+		{
+			name: "Corporate Proxy with IP and Custom Port",
+			jsonConfig: `{
+				"upstream_proxy": "http://10.20.30.40:3128",
+				"pac_url": ""
+			}`,
+			expectedProxy: "http://10.20.30.40:3128",
+			expectedPAC:   "",
+			expectedSSPI:  false,
+		},
+		{
+			name: "Corporate PAC Script Configuration",
+			jsonConfig: `{
+				"upstream_proxy": "",
+				"pac_url": "http://pac.corp.internal/wpad.dat"
+			}`,
+			expectedProxy: "",
+			expectedPAC:   "http://pac.corp.internal/wpad.dat",
+			expectedSSPI:  false,
+		},
+		{
+			name: "Corporate Proxy with SSPI Disabled (Bypass SSPI)",
+			jsonConfig: `{
+				"upstream_proxy": "http://proxy.corp.example.com:8080",
+				"bypass_sspi": true
+			}`,
+			expectedProxy: "http://proxy.corp.example.com:8080",
+			expectedPAC:   "",
+			expectedSSPI:  true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tmpDir := t.TempDir()
+			cfgPath := filepath.Join(tmpDir, "config.json")
+			if err := os.WriteFile(cfgPath, []byte(tt.jsonConfig), 0644); err != nil {
+				t.Fatalf("failed to write config: %v", err)
+			}
+
+			mgr, err := NewManager(cfgPath)
+			if err != nil {
+				t.Fatalf("failed to create config manager: %v", err)
+			}
+			defer mgr.Stop()
+
+			cfg := mgr.Get()
+			if cfg.UpstreamProxy != tt.expectedProxy {
+				t.Errorf("UpstreamProxy: expected %q, got %q", tt.expectedProxy, cfg.UpstreamProxy)
+			}
+			if cfg.PacURL != tt.expectedPAC {
+				t.Errorf("PacURL: expected %q, got %q", tt.expectedPAC, cfg.PacURL)
+			}
+			if cfg.BypassSSPI != tt.expectedSSPI {
+				t.Errorf("BypassSSPI: expected %v, got %v", tt.expectedSSPI, cfg.BypassSSPI)
+			}
+		})
+	}
+}
+

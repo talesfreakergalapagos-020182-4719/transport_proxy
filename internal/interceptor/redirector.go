@@ -330,11 +330,17 @@ func (r *Redirector) packetLoop(ctx context.Context, workerID int) {
 					continue
 				}
 
+				if n <= 0 || n > len(packetBuf) {
+					continue
+				}
+
 				rawPacket := packetBuf[:n]
 
-				// Process IPv4 TCP packets
-				if !addr.IsIPv6() {
-					proto, srcIP, dstIP, ihl, err := ParseIPv4Fast(rawPacket)
+				// Process based on IP version in the header
+				if len(rawPacket) > 0 {
+					version := rawPacket[0] >> 4
+					if version == 4 {
+						proto, srcIP, dstIP, ihl, err := ParseIPv4Fast(rawPacket)
 					if err == nil && proto == IPPROTO_TCP {
 						srcPort, dstPort, tcpFlags, dataOffset, err := ParseTCPFast(rawPacket, ihl)
 						if err == nil {
@@ -508,7 +514,7 @@ func (r *Redirector) packetLoop(ctx context.Context, workerID int) {
 							}
 						}
 					}
-				} else if addr.IsIPv6() {
+				} else if version == 6 {
 					// ----------------------------------------------------
 					// IPv6 Packet Processing (Zero-Alloc Fast Path)
 					// ----------------------------------------------------
@@ -693,6 +699,7 @@ func (r *Redirector) packetLoop(ctx context.Context, workerID int) {
 							}
 						}
 					}
+				}
 				}
 
 				// Reinject unmodified passthrough packet into network stack

@@ -81,7 +81,6 @@ func (pm *ProbeManager) CheckOrProbe(ctx context.Context, ip net.IP) bool {
 	mu.Lock()
 	defer func() {
 		mu.Unlock()
-		pm.probeMu.Delete(ipStr)
 	}()
 
 	// Double-check cache after acquiring lock

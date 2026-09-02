@@ -317,7 +317,7 @@ func (r *Redirector) dnsListenerLoop(ctx context.Context, conn *net.UDPConn) {
 		default:
 		}
 
-		n, _, _, clientAddr, err := conn.ReadMsgUDP(buf, oob)
+		n, oobn, _, clientAddr, err := conn.ReadMsgUDP(buf, oob)
 		if err != nil {
 			r.mu.Lock()
 			isClosed := r.closed
@@ -328,21 +328,28 @@ func (r *Redirector) dnsListenerLoop(ctx context.Context, conn *net.UDPConn) {
 			continue
 		}
 
+		targetIP := defaultTargetIP
+		if oobn > 0 {
+			if origIP := extractOrigDstIP(oob[:oobn]); origIP != nil {
+				targetIP = origIP
+			}
+		}
+
 		queryData := make([]byte, n)
 		copy(queryData, buf[:n])
 
-		go func(cAddr net.Addr, qData []byte) {
+		go func(cAddr net.Addr, qData []byte, tIP net.IP) {
 			if r.dnsEng == nil {
 				return
 			}
-			respData, passthrough := r.dnsEng.ProcessDNSQuery(ctx, cAddr, defaultTargetIP, qData)
+			respData, passthrough := r.dnsEng.ProcessDNSQuery(ctx, cAddr, tIP, qData)
 			if passthrough {
-				respData = r.forwardUDPQuery(ctx, defaultTargetIP, 53, qData)
+				respData = r.forwardUDPQuery(ctx, tIP, 53, qData)
 			}
 			if len(respData) > 0 {
 				_, _ = conn.WriteTo(respData, cAddr)
 			}
-		}(clientAddr, queryData)
+		}(clientAddr, queryData, targetIP)
 	}
 }
 

@@ -142,18 +142,22 @@ func main() {
 		filterMode = "whitelist"
 	}
 
+	lowerMode := strings.ToLower(filterMode)
+	isAllPass := lowerMode == "none" || lowerMode == "off" || lowerMode == "disabled" || lowerMode == "all" || lowerMode == "passthrough"
+
 	var activeDomains, activeIPs []string
-	if filterMode == "blacklist" {
-		activeDomains = cfg.BlockedDomains
-		activeIPs = cfg.BlockedIPs
-	} else {
-		activeDomains = cfg.AllowedDomains
-		activeIPs = cfg.AllowedIPs
+	if !isAllPass {
+		if filterMode == "blacklist" {
+			activeDomains = cfg.BlockedDomains
+			activeIPs = cfg.BlockedIPs
+		} else {
+			activeDomains = cfg.AllowedDomains
+			activeIPs = cfg.AllowedIPs
+		}
 	}
 
 	filterEng := filter.NewEngine(filterMode, activeDomains, activeIPs)
-	lowerMode := strings.ToLower(filterMode)
-	if lowerMode == "none" || lowerMode == "off" || lowerMode == "disabled" || lowerMode == "all" || lowerMode == "passthrough" {
+	if isAllPass {
 		log.Printf("[Filter] Initialized in ALL-PASS mode (filtering disabled: all outbound traffic allowed)")
 	} else {
 		log.Printf("[Filter] Initialized in %s mode with %d domain rules, %d IP rules",
@@ -166,18 +170,21 @@ func main() {
 		if mode == "" {
 			mode = "whitelist"
 		}
+		mLower := strings.ToLower(mode)
+		isAllPassReload := mLower == "none" || mLower == "off" || mLower == "disabled" || mLower == "all" || mLower == "passthrough"
 		var d, ips []string
-		if mode == "blacklist" {
-			d = newCfg.BlockedDomains
-			ips = newCfg.BlockedIPs
-		} else {
-			d = newCfg.AllowedDomains
-			ips = newCfg.AllowedIPs
+		if !isAllPassReload {
+			if mode == "blacklist" {
+				d = newCfg.BlockedDomains
+				ips = newCfg.BlockedIPs
+			} else {
+				d = newCfg.AllowedDomains
+				ips = newCfg.AllowedIPs
+			}
 		}
 		filterEng.UpdateRules(mode, d, ips)
 		pacResolver.UpdateConfig(newCfg.PacURL, newCfg.UpstreamProxy)
-		mLower := strings.ToLower(mode)
-		if mLower == "none" || mLower == "off" || mLower == "disabled" || mLower == "all" || mLower == "passthrough" {
+		if isAllPassReload {
 			log.Printf("[Config] Reloaded: ALL-PASS mode (filtering disabled). PAC=%s, Upstream=%s",
 				newCfg.PacURL, newCfg.UpstreamProxy)
 		} else {
@@ -296,12 +303,8 @@ func main() {
 		log.Printf("[Shutdown] Proxy server closed and drained.")
 	}
 
-	// Step 4: Close PAC resolver and config manager
-	pacResolver.Close()
-	cfgMgr.Stop()
-
-	// Step 5: Stop PortGuard and release OS port exclusion
-	portGuard.Stop()
+	// Step 4: Close PAC resolver and config manager (handled by defer)
+	// Step 5: Stop PortGuard and release OS port exclusion (handled by defer)
 
 	log.Printf("[Shutdown] Graceful shutdown completed cleanly. Goodbye.")
 }

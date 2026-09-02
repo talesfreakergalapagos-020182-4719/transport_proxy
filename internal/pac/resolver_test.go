@@ -9,10 +9,6 @@ import (
 )
 
 func TestPACResolver_Evaluation(t *testing.T) {
-	if runtime.GOOS != "windows" {
-		t.Skip("PAC tests run on Windows only")
-	}
-
 	// Spin up local HTTP server serving a test PAC file
 	pacContent := `
 function FindProxyForURL(url, host) {
@@ -41,8 +37,7 @@ function FindProxyForURL(url, host) {
 		t.Fatalf("Resolve failed for internal host: %v", err)
 	}
 	if !d1.IsDirect {
-		t.Skipf("WinHTTP PAC download unavailable in this sandbox environment (fallback to DIRECT): %v", d1)
-		return
+		t.Errorf("Expected DIRECT for internal host, got: %v", d1)
 	}
 
 	// Test 2: External host -> should resolve to PROXY
@@ -51,8 +46,7 @@ function FindProxyForURL(url, host) {
 		t.Fatalf("Resolve failed for external host: %v", err)
 	}
 	if d2.IsDirect {
-		t.Skipf("WinHTTP PAC download unavailable in this sandbox environment (fallback to DIRECT)")
-		return
+		t.Errorf("Expected PROXY for external host, got DIRECT")
 	}
 	if d2.ProxyURL != "http://upstream-proxy.corp:8080" {
 		t.Errorf("Expected http://upstream-proxy.corp:8080, got %s", d2.ProxyURL)
@@ -98,3 +92,176 @@ func TestStaticResolver(t *testing.T) {
 		t.Errorf("Expected http://static-proxy:8080, got %s", dWithPort.ProxyURL)
 	}
 }
+
+func TestResolver_Cleanup_Lifecycle(t *testing.T) {
+	// BUG-13 および BUG-6 に関連する、リソースリークとシャットダウンクリーンアップの検証
+	resolver, err := NewResolver("", "http://cleanup-test:8080")
+	if err != nil {
+		t.Fatalf("Failed to create resolver: %v", err)
+	}
+
+	// 複数回 Close() を呼んでもパニックにならず、安全に処理されるかを検証（冪等性）
+	resolver.Close()
+	resolver.Close()
+
+	// 既に Close された状態での Resolve 呼び出しが安全にフェールするか（あるいはそのままスタティック応答を返すか）
+	// 現行の仕様では、スタティックプロキシの場合は Close 状態でも応答自体は可能なので、パニックにならないことだけを確認
+	_, _ = resolver.Resolve("example.com", 80)
+}
+
+func TestPAC_AutoDetection(t *testing.T) {
+	testCases := []struct {
+		name           string
+		pacURL         string
+		staticProxy    string
+		expectedPAC    bool
+		expectedPACURL string
+	}{
+		{
+			name:           "Explicit PAC URL",
+			pacURL:         "http://pac.corp.local/proxy.pac",
+			staticProxy:    "",
+			expectedPAC:    true,
+			expectedPACURL: "http://pac.corp.local/proxy.pac",
+		},
+		{
+			name:           "PAC URL in static_proxy ending with .pac",
+			pacURL:         "",
+			staticProxy:    "http://corp.local/autoproxy.pac",
+			expectedPAC:    true,
+			expectedPACURL: "http://corp.local/autoproxy.pac",
+		},
+		{
+			name:           "WPAD DAT file in static_proxy",
+			pacURL:         "",
+			staticProxy:    "http://wpad.corp.local/wpad.dat",
+			expectedPAC:    true,
+			expectedPACURL: "http://wpad.corp.local/wpad.dat",
+		},
+		{
+			name:           "pac+ scheme prefix in static_proxy",
+			pacURL:         "",
+			staticProxy:    "pac+http://proxy.corp.local:8080/script",
+			expectedPAC:    true,
+			expectedPACURL: "http://proxy.corp.local:8080/script",
+		},
+		{
+			name:           "Standard static HTTP proxy (not PAC)",
+			pacURL:         "",
+			staticProxy:    "http://proxy.corp.local:8080",
+			expectedPAC:    false,
+			expectedPACURL: "",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			r, err := NewResolver(tc.pacURL, tc.staticProxy)
+			if err != nil {
+				// WinHTTP session init may fail in headless/restricted environment
+				t.Skipf("PAC session init skipped: %v", err)
+				return
+			}
+			defer r.Close()
+
+			if r.isPACMode != tc.expectedPAC {
+				t.Errorf("Expected isPACMode=%v, got %v", tc.expectedPAC, r.isPACMode)
+			}
+			if r.pacURL != tc.expectedPACURL {
+				t.Errorf("Expected pacURL=%q, got %q", tc.expectedPACURL, r.pacURL)
+			}
+		})
+	}
+}
+
+func TestPAC_DynamicUpdateConfig(t *testing.T) {
+	// Initialize with static proxy
+	r, err := NewResolver("", "http://initial-proxy:8080")
+	if err != nil {
+		t.Fatalf("Failed to create resolver: %v", err)
+	}
+	defer r.Close()
+
+	// Initial evaluation
+	d1, err := r.Resolve("site1.com", 80)
+	if err != nil {
+		t.Fatalf("Resolve failed: %v", err)
+	}
+	if d1.ProxyURL != "http://initial-proxy:8080" {
+		t.Errorf("Expected http://initial-proxy:8080, got %s", d1.ProxyURL)
+	}
+
+	// Update configuration dynamically to a different static proxy
+	r.UpdateConfig("", "http://updated-proxy:3128")
+	d2, err := r.Resolve("site1.com", 80)
+	if err != nil {
+		t.Fatalf("Resolve after update failed: %v", err)
+	}
+	if d2.ProxyURL != "http://updated-proxy:3128" {
+		t.Errorf("Expected http://updated-proxy:3128 after update, got %s", d2.ProxyURL)
+	}
+
+	// Test ResolveRouting interface
+	isDirect, proxyURL, err := r.ResolveRouting("site2.com", 443)
+	if err != nil {
+		t.Fatalf("ResolveRouting failed: %v", err)
+	}
+	if isDirect {
+		t.Errorf("Expected isDirect=false for updated proxy")
+	}
+	if proxyURL != "http://updated-proxy:3128" {
+		t.Errorf("Expected proxyURL=http://updated-proxy:3128, got %s", proxyURL)
+	}
+}
+
+func TestPAC_Linux_PACSupport(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("This test verifies Linux-specific PAC execution and fallback")
+	}
+
+	// 1. Unreachable PAC path -> safe fallback to DIRECT immediately
+	rUnreachable, err := NewResolver("/tmp/nonexistent_pac_file_12345.pac", "")
+	if err != nil {
+		t.Fatalf("NewResolver on Linux should not return error: %v", err)
+	}
+	defer rUnreachable.Close()
+
+	d, err := rUnreachable.Resolve("example.com", 443)
+	if err != nil {
+		t.Fatalf("Resolve on Linux fallback should not return error: %v", err)
+	}
+	if !d.IsDirect {
+		t.Errorf("Expected IsDirect=true on unreachable PAC fallback, got false")
+	}
+
+	// 2. Valid PAC server on Linux -> evaluated with JSEngine
+	pacScript := `
+function FindProxyForURL(url, host) {
+    if (host == "internal-service.local") return "DIRECT";
+    return "PROXY linux-pac-proxy.corp:8080";
+}
+`
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, pacScript)
+	}))
+	defer ts.Close()
+
+	rValid, err := NewResolver(ts.URL+"/proxy.pac", "")
+	if err != nil {
+		t.Fatalf("Failed to init PAC resolver on Linux: %v", err)
+	}
+	defer rValid.Close()
+
+	dInternal, err := rValid.Resolve("internal-service.local", 80)
+	if err != nil || !dInternal.IsDirect {
+		t.Errorf("Expected DIRECT for internal-service.local, got %v (err: %v)", dInternal, err)
+	}
+
+	dExternal, err := rValid.Resolve("external-site.org", 443)
+	if err != nil || dExternal.IsDirect || dExternal.ProxyURL != "http://linux-pac-proxy.corp:8080" {
+		t.Errorf("Expected PROXY for external-site.org, got %v (err: %v)", dExternal, err)
+	}
+}
+
+
+

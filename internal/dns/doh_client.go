@@ -24,7 +24,6 @@ type ProxyDecisionResolver interface {
 type DoHClient struct {
 	client     *http.Client
 	timeout    time.Duration
-	pacResolve func(host string, port uint16) (bool, string, error)
 }
 
 // NewDoHClient initializes a new DoH client with connection pooling and loop-preventing dialer.

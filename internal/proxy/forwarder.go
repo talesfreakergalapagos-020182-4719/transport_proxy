@@ -162,12 +162,16 @@ func PipeConnEx(c1 net.Conn, c2 net.Conn, clientPreBuffered io.Reader, upstreamP
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// Determine deadline refresh interval to avoid calling expensive OS SetDeadline on every packet
-	deadlineRefreshInterval := idleTimeout / 4
-	if deadlineRefreshInterval > 30*time.Second {
-		deadlineRefreshInterval = 30 * time.Second
-	} else if deadlineRefreshInterval < 5*time.Second && idleTimeout > 5*time.Second {
-		deadlineRefreshInterval = 5 * time.Second
+	var deadlineRefreshInterval time.Duration
+	if idleTimeout <= 0 {
+		deadlineRefreshInterval = 0
+	} else {
+		deadlineRefreshInterval = idleTimeout / 4
+		if deadlineRefreshInterval > 30*time.Second {
+			deadlineRefreshInterval = 30 * time.Second
+		} else if deadlineRefreshInterval < 5*time.Second && idleTimeout > 5*time.Second {
+			deadlineRefreshInterval = 5 * time.Second
+		}
 	}
 
 	c1AddrStr := c1.RemoteAddr().String()
@@ -193,8 +197,10 @@ func PipeConnEx(c1 net.Conn, c2 net.Conn, clientPreBuffered io.Reader, upstreamP
 
 		var src io.Reader = c2
 		if upstreamPreBuffered != nil {
-			if br, ok := upstreamPreBuffered.(*bufio.Reader); !ok || br != nil {
+			if br, ok := upstreamPreBuffered.(*bufio.Reader); ok && br != nil {
 				src = upstreamPreBuffered
+			} else {
+				src = io.MultiReader(upstreamPreBuffered, c2)
 			}
 		}
 
@@ -285,8 +291,10 @@ func PipeConnEx(c1 net.Conn, c2 net.Conn, clientPreBuffered io.Reader, upstreamP
 
 		var clientSrc io.Reader = c1
 		if clientPreBuffered != nil {
-			if br, ok := clientPreBuffered.(*bufio.Reader); !ok || br != nil {
+			if br, ok := clientPreBuffered.(*bufio.Reader); ok && br != nil {
 				clientSrc = clientPreBuffered
+			} else {
+				clientSrc = io.MultiReader(clientPreBuffered, c1)
 			}
 		}
 

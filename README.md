@@ -251,7 +251,7 @@ export all_proxy=http://127.0.0.1:18080
 }
 ```
 
-> **注意 (Ubuntu版について)**: `pac_url` による PAC 解析は Windows 版の独自機能（WinHTTP API 利用）のため、**Ubuntu (Linux) 版では機能しません（指定しても無視され直接接続になります）**。Ubuntu で上位プロキシを利用する場合は、PAC は使わずに `"upstream_proxy"` で直接指定するか、OS の環境変数（`http_proxy` / `https_proxy`）を設定してください。
+> **PAC 機能（Windows & Ubuntu 両対応）**: 内蔵のピュア Go JavaScript エンジン（`goja`）により、Windows・Ubuntu（Linux / WSL / Docker）の双方で PAC ファイル（`FindProxyForURL`）を自動評価し、社内/社外プロキシの自動切り替えが可能です。
 >
 #### パターン 5: DNS 設定（社内/クラウド DNS 直通 vs デフォルト DoH）
 
@@ -455,7 +455,75 @@ go build -ldflags="-s -w" -o tproxy.exe ./cmd/tproxy
 
 # Ubuntu: リリースビルド
 go build -ldflags="-s -w" -o tproxy ./cmd/tproxy
-
-# テスト実行（共通）
-go test -count=1 ./...
 ```
+
+---
+
+## 🧪 テストの実行方法
+
+本プロジェクトには、Windows ネイティブ・WSL (Linux)・Docker (Ubuntu) の 3 環境で自動テストを実行できるテストオーケストレーションツールおよび豊富な単体・統合テストが備わっています。
+
+### 1. 全環境一括自動テスト（推奨）
+
+Windows の PowerShell から以下のスクリプトを実行するだけで、**Windows・WSL・Docker (Ubuntu) の 3 環境を順番に自動検出し、全テストスイートを実行** します。
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\run_tests_all.ps1
+```
+
+#### スクリプトの主なオプション：
+```powershell
+# WSL テストをスキップして Windows と Docker のみ実行
+.\scripts\run_tests_all.ps1 -SkipWSL
+
+# Docker テストをスキップして Windows と WSL のみ実行
+.\scripts\run_tests_all.ps1 -SkipDocker
+
+# Windows テストをスキップ
+.\scripts\run_tests_all.ps1 -SkipWindows
+```
+
+---
+
+### 2. 環境別の個別テスト実行
+
+#### A. Windows ネイティブで実行
+```powershell
+# 全テストの実行
+go test -v ./...
+
+# レースコンディション（競合状態）検出
+go test -race ./...
+
+# 特定パッケージのテスト（例: PAC エンジン）
+go test -v ./internal/pac
+
+# 特定テストの実行（例: 大容量ファイル転送テスト）
+go test -v ./internal/proxy -run TestPipeConnEx_LargeFileTransfer
+```
+
+#### B. WSL (Linux) から実行
+```bash
+# WSL ターミナルまたは Windows から WSL 経由で実行
+wsl -- bash -c "cd /mnt/t/agy_test/transport_proxy && go test -v ./..."
+```
+
+#### C. Docker (Ubuntu コンテナ) で実行
+```bash
+# WSL 経由でテスト用 Ubuntu コンテナをビルド・実行
+wsl -- bash -c "docker build -f Dockerfile.test -t tproxy-test . && docker run --rm tproxy-test"
+```
+
+---
+
+### 3. 主なテスト対象と検証内容
+
+| テスト項目 | 対象パッケージ | 検証内容 |
+| :--- | :--- | :--- |
+| **ドメインフィルタリング** | `internal/filter` | ホワイトリスト / ブラックリスト / All-Pass モードおよび IPv6 の判定 |
+| **パケット傍受・NAT** | `internal/interceptor` | L7 スニッフィング（SNI / HTTP Host）、RFC 1624 高速チェックサム計算、ポート競合検知 |
+| **プロキシ転送・可用性** | `internal/proxy` | E2E プロキシトンネル、双方向ストリーム、**20MB 大容量ファイル転送**、ポート自動フォールバック |
+| **社内プロキシ・認証** | `internal/sspi`, `internal/proxy` | 上位プロキシ設定、**NTLM / ケルベロス (Negotiate) 統合Windows認証**、407/502 エラーハンドリング |
+| **PAC エンジン** | `internal/pac` | **ピュア Go (goja) によるクロスプラットフォーム PAC 評価**、タイムアウト遮断、動的ホットリロード |
+| **DNS 昇格・DoH** | `internal/dns` | RFC 1035/8484 パース、キャッシュ、同時クエリのコアレシング、ポリシーブロック |
+

@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"syscall"
+
+	"transport_proxy/internal/config"
 )
 
 var outboundPortCounter atomic.Uint32
@@ -30,18 +32,16 @@ func isPortBindError(err error) bool {
 }
 
 // dialTCP connects to the given network address using a local port bound
-// to the reserved range (40000-48999) to prevent WinDivert self-interception loop.
+// to the reserved range to prevent WinDivert self-interception loop.
 func (f *Forwarder) dialTCP(network, address string) (net.Conn, error) {
 	const (
-		portMin     = 40000
-		portMax     = 48999
-		rangeSize   = portMax - portMin + 1
 		maxAttempts = 50
 	)
+	rangeSize := config.OutboundPortMax - config.OutboundPortMin + 1
 
 	var lastErr error
 	for i := 0; i < maxAttempts; i++ {
-		port := portMin + int(outboundPortCounter.Add(1)%rangeSize)
+		port := int(config.OutboundPortMin) + int(outboundPortCounter.Add(1)%uint32(rangeSize))
 		dialer := &net.Dialer{
 			Timeout:   f.connectTimeout,
 			LocalAddr: &net.TCPAddr{Port: port},

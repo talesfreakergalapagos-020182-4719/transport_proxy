@@ -5,6 +5,7 @@ import (
 	"log"
 	"net"
 	"net/url"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -82,6 +83,7 @@ func NewResolver(pacURL string, staticProxy string) (*Resolver, error) {
 
 	go r.cacheCleanupLoop()
 
+	runtime.SetFinalizer(r, (*Resolver).Close)
 	return r, nil
 }
 

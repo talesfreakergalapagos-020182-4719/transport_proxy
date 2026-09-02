@@ -185,13 +185,11 @@ func (ctx *SSPIContext) NextStep(serverTokenBase64 string) (clientToken string, 
 	var pInCtxt uintptr
 	pOutCtxt := uintptr(unsafe.Pointer(&ctx.ctxtHandle))
 	var pTargetName uintptr
-	var pCred uintptr
+	pCred := uintptr(unsafe.Pointer(&ctx.credHandle))
 	if ctx.hasCtxt {
-		pCred = 0
 		pInCtxt = uintptr(unsafe.Pointer(&ctx.ctxtHandle))
 		pTargetName = 0 // Must be NULL on subsequent calls
 	} else {
-		pCred = uintptr(unsafe.Pointer(&ctx.credHandle))
 		pTargetName = uintptr(unsafe.Pointer(ctx.targetSPN))
 	}
 
@@ -355,12 +353,9 @@ func (ctx *ServerSSPIContext) AcceptStep(clientTokenBase64 string) (serverToken 
 
 	var pInCtxt uintptr
 	pOutCtxt := uintptr(unsafe.Pointer(&ctx.ctxtHandle))
-	var pCred uintptr
+	pCred := uintptr(unsafe.Pointer(&ctx.credHandle))
 	if ctx.hasCtxt {
-		pCred = 0
 		pInCtxt = uintptr(unsafe.Pointer(&ctx.ctxtHandle))
-	} else {
-		pCred = uintptr(unsafe.Pointer(&ctx.credHandle))
 	}
 
 	r, _, _ := procAcceptSecurityContext.Call(
