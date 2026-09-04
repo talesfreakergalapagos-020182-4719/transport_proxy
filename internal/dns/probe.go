@@ -38,8 +38,21 @@ func NewProbeManager(dohClient *DoHClient, cacheTTL time.Duration) *ProbeManager
 	}
 
 	pm := &ProbeManager{
-		cacheTTL:       cacheTTL,
-		dohClient:      dohClient,
+		cacheTTL:  cacheTTL,
+		dohClient: dohClient,
+	}
+
+	// Pre-seed default Cloudflare Security DNS as supported to eliminate cold-start probe latency
+	now := time.Now()
+	defaultDoH := []string{
+		"1.1.1.2", "1.0.0.2",
+		"2606:4700:4700::1112", "2606:4700:4700::1002",
+	}
+	for _, ipStr := range defaultDoH {
+		pm.cache.Store(ipStr, &probeEntry{
+			status:   StatusSupported,
+			expireAt: now.Add(24 * time.Hour),
+		})
 	}
 
 	return pm
@@ -47,6 +60,9 @@ func NewProbeManager(dohClient *DoHClient, cacheTTL time.Duration) *ProbeManager
 
 // GetStatus returns the cached DoH status for an IP without performing a network probe.
 func (pm *ProbeManager) GetStatus(ip net.IP) DoHSupportStatus {
+	if ip == nil || ip.IsLoopback() || ip.IsUnspecified() {
+		return StatusUnsupported
+	}
 
 	key := ip.String()
 	val, ok := pm.cache.Load(key)
@@ -65,6 +81,9 @@ func (pm *ProbeManager) GetStatus(ip net.IP) DoHSupportStatus {
 
 // CheckOrProbe checks cached status or sends a test DoH probe query to determine support.
 func (pm *ProbeManager) CheckOrProbe(ctx context.Context, ip net.IP) bool {
+	if ip == nil || ip.IsLoopback() || ip.IsUnspecified() {
+		return false
+	}
 
 	status := pm.GetStatus(ip)
 	if status == StatusSupported {

@@ -77,7 +77,18 @@ func (e *Engine) ProcessDNSQuery(ctx context.Context, clientAddr net.Addr, dstIP
 	qname := q.Name
 	qtype := q.Type
 	typeStr := TypeToString(qtype)
-	targetDisplay := net.JoinHostPort(dstIP.String(), "53")
+
+	// Sanitize target IP: Loopback, unspecified, or private IPs cannot be public DoH servers.
+	// When custom DNS is not configured, safely fallback to Cloudflare Security DoH.
+	targetIP := dstIP
+	if targetIP == nil || targetIP.IsLoopback() || targetIP.IsUnspecified() || (targetIP.IsPrivate() && !cfg.IsCustomDNS()) {
+		if targetIP != nil && targetIP.To4() == nil && len(targetIP) == net.IPv6len {
+			targetIP = net.ParseIP("2606:4700:4700::1112")
+		} else {
+			targetIP = net.IPv4(1, 1, 1, 2)
+		}
+	}
+	targetDisplay := net.JoinHostPort(targetIP.String(), "53")
 
 	// 2. Policy Filtering Evaluation (Whitelist / Blacklist)
 	if e.filterEng != nil && e.filterEng.ShouldBlock(qname) {
@@ -89,7 +100,7 @@ func (e *Engine) ProcessDNSQuery(ctx context.Context, clientAddr net.Addr, dstIP
 
 	// 3. DNS Answer Cache Check (0ms resolution)
 	if e.cache != nil && cfg.DNSCacheEnabled {
-		if cachedResp, hit := e.cache.Get(dstIP, qname, qtype, msg.Header.ID); hit {
+		if cachedResp, hit := e.cache.Get(targetIP, qname, qtype, msg.Header.ID); hit {
 			logger.Debugf("[DNS]   CACHE HIT | Client: %s | Target: %s | Query: %s (%s)",
 				clientAddr.String(), targetDisplay, qname, typeStr)
 			return cachedResp, false
@@ -97,20 +108,20 @@ func (e *Engine) ProcessDNSQuery(ctx context.Context, clientAddr net.Addr, dstIP
 	}
 
 	// 5. Dynamic DoH Capability Check (or Active Probe on first encounter)
-	isDoHCapable := e.probeMgr.CheckOrProbe(ctx, dstIP)
+	isDoHCapable := e.probeMgr.CheckOrProbe(ctx, targetIP)
 	if !isDoHCapable {
 		return nil, true // Passthrough to normal UDP 53
 	}
 
 	// 6. Execute DoH Query with Query Coalescing (Singleflight) to deduplicate simultaneous bursts
 	startTime := time.Now()
-	dohResp, shared, dohErr := e.coalesce.Do(dstIP, qname, qtype, func() ([]byte, error) {
-		return e.dohClient.QueryDoH(ctx, dstIP, payload)
+	dohResp, shared, dohErr := e.coalesce.Do(targetIP, qname, qtype, func() ([]byte, error) {
+		return e.dohClient.QueryDoH(ctx, targetIP, payload)
 	})
 	duration := time.Since(startTime).Round(time.Millisecond)
 
 	if dohErr != nil {
-		logger.Debugf("[DNS]   DoH query to %s failed: %v", BuildDoHURL(dstIP), dohErr)
+		logger.Debugf("[DNS]   DoH query to %s failed: %v", BuildDoHURL(targetIP), dohErr)
 		if cfg.FallbackToUDP {
 			logger.Debugf("[DNS]   Falling back to standard UDP 53 for %s", targetDisplay)
 			return nil, true
@@ -121,7 +132,7 @@ func (e *Engine) ProcessDNSQuery(ctx context.Context, clientAddr net.Addr, dstIP
 
 	// Store original clean dohResp in cache before ID modification
 	if !shared && e.cache != nil && cfg.DNSCacheEnabled {
-		e.cache.Set(dstIP, qname, qtype, dohResp)
+		e.cache.Set(targetIP, qname, qtype, dohResp)
 	}
 
 	// Return defensive copy matching client transaction ID to prevent race condition across coalesced callers

@@ -275,6 +275,87 @@ func TestCache_SetMaxTTL(t *testing.T) {
 	}
 }
 
+func TestProbeManager_LoopbackRejection(t *testing.T) {
+	client := NewDoHClient(1*time.Second, nil)
+	pm := NewProbeManager(client, 1*time.Hour)
+
+	loopbacks := []net.IP{
+		net.ParseIP("127.0.0.1"),
+		net.ParseIP("127.0.0.53"),
+		net.ParseIP("::1"),
+		net.ParseIP("0.0.0.0"),
+		nil,
+	}
+
+	for _, ip := range loopbacks {
+		if status := pm.GetStatus(ip); status != StatusUnsupported {
+			t.Errorf("Expected GetStatus(%v) to be StatusUnsupported, got %v", ip, status)
+		}
+		if pm.CheckOrProbe(context.Background(), ip) {
+			t.Errorf("Expected CheckOrProbe(%v) to return false for loopback/unspecified IP", ip)
+		}
+	}
+}
+
+func TestProbeManager_PreSeededDoH(t *testing.T) {
+	client := NewDoHClient(1*time.Second, nil)
+	pm := NewProbeManager(client, 1*time.Hour)
+
+	if status := pm.GetStatus(net.ParseIP("1.1.1.2")); status != StatusSupported {
+		t.Errorf("Expected 1.1.1.2 to be pre-seeded as StatusSupported, got %v", status)
+	}
+	if status := pm.GetStatus(net.ParseIP("1.0.0.2")); status != StatusSupported {
+		t.Errorf("Expected 1.0.0.2 to be pre-seeded as StatusSupported, got %v", status)
+	}
+}
+
+func TestEngine_LoopbackDstIPFallback(t *testing.T) {
+	tempDir := t.TempDir()
+	configPath := filepath.Join(tempDir, "config.json")
+	_ = os.WriteFile(configPath, []byte(`{"doh_enabled": true, "dns_cache_enabled": true}`), 0644)
+	mgr, err := config.NewManager(configPath)
+	if err != nil {
+		t.Fatalf("NewManager failed: %v", err)
+	}
+	defer mgr.Stop()
+
+	filter := &mockFilter{
+		blockedHosts: map[string]bool{
+			"blocked.com": true,
+		},
+	}
+
+	eng := NewEngine(mgr, filter, nil)
+
+	clientAddr, _ := net.ResolveUDPAddr("udp", "127.0.0.1:54321")
+	// Pass loopback dstIP (which happens on Linux iptables REDIRECT)
+	dstIP := net.ParseIP("127.0.0.1")
+	query := createTestQuery(0x7777, "blocked.com", TypeA)
+
+	// Blocked query should be handled properly even when dstIP is 127.0.0.1
+	resp, passthrough := eng.ProcessDNSQuery(context.Background(), clientAddr, dstIP, query)
+	if passthrough {
+		t.Errorf("Expected passthrough=false for blocked domain with loopback dstIP")
+	}
+	if len(resp) < 12 || resp[3]&0x0F != RCodeNXDomain {
+		t.Errorf("Expected NXDOMAIN response")
+	}
+
+	// Cache test with loopback dstIP: Pre-populate cache at 1.1.1.2 (sanitized target)
+	cacheResp := createTestQuery(0x8888, "cached.com", TypeA)
+	cacheResp[2] = 0x81
+	eng.cache.Set(net.ParseIP("1.1.1.2"), "cached.com", TypeA, cacheResp)
+
+	queryCached := createTestQuery(0x9999, "cached.com", TypeA)
+	hitResp, passthrough := eng.ProcessDNSQuery(context.Background(), clientAddr, dstIP, queryCached)
+	if passthrough {
+		t.Errorf("Expected cache hit (passthrough=false)")
+	}
+	if len(hitResp) < 12 || hitResp[0] != 0x99 || hitResp[1] != 0x99 {
+		t.Errorf("Expected rewritten ID 0x9999 on cache hit with loopback dstIP")
+	}
+}
+
 
 func BenchmarkDNSCache_Get(b *testing.B) {
 	cache := NewCache(10 * time.Minute)

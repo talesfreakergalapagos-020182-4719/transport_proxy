@@ -337,8 +337,15 @@ func (r *Redirector) dnsListenerLoop(ctx context.Context, conn *net.UDPConn) {
 
 		targetIP := defaultTargetIP
 		if oobn > 0 {
-			if origIP := extractOrigDstIP(oob[:oobn]); origIP != nil {
+			if origIP := extractOrigDstIP(oob[:oobn]); origIP != nil && !origIP.IsLoopback() && !origIP.IsUnspecified() && !origIP.IsPrivate() {
 				targetIP = origIP
+			}
+		}
+
+		// If client is IPv6, use IPv6 Cloudflare DoH default when using default target
+		if clientAddr != nil && clientAddr.IP.To4() == nil && len(clientAddr.IP) == net.IPv6len {
+			if targetIP.Equal(defaultTargetIP) {
+				targetIP = net.ParseIP("2606:4700:4700::1112")
 			}
 		}
 
@@ -362,6 +369,10 @@ func (r *Redirector) dnsListenerLoop(ctx context.Context, conn *net.UDPConn) {
 
 // forwardUDPQuery relays a DNS query to the target using a marked socket to bypass iptables.
 func (r *Redirector) forwardUDPQuery(ctx context.Context, dstIP net.IP, port int, data []byte) []byte {
+	// Guard against loopback or unspecified destinations in passthrough
+	if dstIP == nil || dstIP.IsLoopback() || dstIP.IsUnspecified() {
+		dstIP = net.IPv4(1, 1, 1, 2)
+	}
 	targetAddr := &net.UDPAddr{IP: dstIP, Port: port}
 	
 	dialer := &net.Dialer{
