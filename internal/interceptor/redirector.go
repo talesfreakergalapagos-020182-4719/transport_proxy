@@ -75,7 +75,10 @@ func NewRedirector(localListenAddr string, customFilter string) (*Redirector, er
 
 	var ip net.IP
 	if host != "" && host != "0.0.0.0" && host != "::" {
-		ip = net.ParseIP(host)
+		parsed := net.ParseIP(host)
+		if parsed != nil && !parsed.IsLoopback() {
+			ip = parsed
+		}
 	}
 
 	pid := os.Getpid()

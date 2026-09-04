@@ -271,3 +271,36 @@ func TestAddressFormatting_IPv4_IPv6(t *testing.T) {
 		}
 	}
 }
+
+func TestAcquireListener_IPv4_IPv6(t *testing.T) {
+	testAddrs := []struct {
+		addr   string
+		desc   string
+		skipV6 bool
+	}{
+		{":0", "Wildcard dual-stack port 0", false},
+		{"127.0.0.1:0", "IPv4 loopback port 0", false},
+		{"0.0.0.0:0", "IPv4 any port 0", false},
+		{"[::]:0", "IPv6 wildcard port 0", true},
+		{"[::1]:0", "IPv6 loopback port 0", true},
+	}
+
+	for _, tc := range testAddrs {
+		t.Run(tc.desc, func(t *testing.T) {
+			ln, port, err := AcquireListener(tc.addr)
+			if err != nil {
+				if tc.skipV6 && strings.Contains(strings.ToLower(err.Error()), "bind") {
+					t.Skipf("Skipping IPv6 test (IPv6 not available on host): %v", err)
+					return
+				}
+				t.Fatalf("AcquireListener(%q) failed: %v", tc.addr, err)
+			}
+			defer ln.Close()
+
+			if port == 0 {
+				t.Errorf("Expected non-zero port, got 0")
+			}
+			t.Logf("AcquireListener(%q) succeeded on %s (port %d)", tc.addr, ln.Addr().String(), port)
+		})
+	}
+}

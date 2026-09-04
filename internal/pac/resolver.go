@@ -294,18 +294,41 @@ func (r *Resolver) Close() {
 
 func parseFirstProxy(proxyList string) string {
 	parts := strings.Split(proxyList, ";")
-	if len(parts) == 0 {
-		return ""
+	for _, opt := range parts {
+		opt = strings.TrimSpace(opt)
+		if opt == "" {
+			continue
+		}
+		fields := strings.Fields(opt)
+		if len(fields) == 0 {
+			continue
+		}
+
+		schemeType := strings.ToUpper(fields[0])
+		if schemeType == "DIRECT" {
+			return "DIRECT"
+		}
+
+		if len(fields) >= 2 && (schemeType == "PROXY" || schemeType == "HTTP" || schemeType == "HTTPS" || schemeType == "SOCKS" || schemeType == "SOCKS5") {
+			hostPort := fields[1]
+			if strings.HasPrefix(hostPort, "http://") || strings.HasPrefix(hostPort, "https://") || strings.HasPrefix(hostPort, "socks5://") {
+				return hostPort
+			}
+			switch schemeType {
+			case "HTTPS":
+				return "https://" + hostPort
+			case "SOCKS", "SOCKS5":
+				return "socks5://" + hostPort
+			case "PROXY", "HTTP":
+				return "http://" + hostPort
+			default:
+				return "http://" + hostPort
+			}
+		}
+
+		return opt
 	}
-	first := strings.TrimSpace(parts[0])
-	fields := strings.Fields(first)
-	if len(fields) == 2 {
-		return fields[1]
-	}
-	if len(fields) == 1 {
-		return fields[0]
-	}
-	return first
+	return ""
 }
 
 func normalizeProxyURL(p string) string {

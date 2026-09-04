@@ -3,9 +3,13 @@ package dns
 import (
 	"encoding/binary"
 	"net"
+	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 )
+
+const maxDNSCacheEntries = 10000
 
 type cacheEntry struct {
 	response []byte
@@ -14,18 +18,25 @@ type cacheEntry struct {
 
 // Cache provides a thread-safe in-memory cache for DNS responses.
 type Cache struct {
-	entries sync.Map // map[string]*cacheEntry
-	maxTTL  time.Duration
+	entries  sync.Map // map[CacheKey]*cacheEntry
+	count    atomic.Int32
+	maxTTL   time.Duration
+	stopChan chan struct{}
+	stopOnce sync.Once
 }
 
-// NewCache initializes a new DNS cache with the specified maximum TTL.
+// NewCache initializes a new DNS cache with the specified maximum TTL and starts background cleanup.
 func NewCache(maxTTL time.Duration) *Cache {
 	if maxTTL <= 0 {
 		maxTTL = 300 * time.Second
 	}
-	return &Cache{
-		maxTTL: maxTTL,
+	c := &Cache{
+		maxTTL:   maxTTL,
+		stopChan: make(chan struct{}),
 	}
+	go c.cleanupLoop()
+	runtime.SetFinalizer(c, (*Cache).Stop)
+	return c
 }
 
 // CacheKey uniquely identifies a cached DNS query without string heap allocations.
@@ -57,7 +68,9 @@ func (c *Cache) Get(dstIP net.IP, qname string, qtype uint16, reqID uint16) ([]b
 
 	entry := val.(*cacheEntry)
 	if time.Now().After(entry.expireAt) {
-		c.entries.Delete(key)
+		if _, loaded := c.entries.LoadAndDelete(key); loaded {
+			c.count.Add(-1)
+		}
 		return nil, false
 	}
 
@@ -89,10 +102,17 @@ func (c *Cache) Set(dstIP net.IP, qname string, qtype uint16, resp []byte) {
 	respCopy := make([]byte, len(resp))
 	copy(respCopy, resp)
 
-	c.entries.Store(key, &cacheEntry{
+	entry := &cacheEntry{
 		response: respCopy,
 		expireAt: time.Now().Add(ttl),
-	})
+	}
+
+	if _, loaded := c.entries.Swap(key, entry); !loaded {
+		if c.count.Add(1) > maxDNSCacheEntries {
+			// Capacity limit exceeded: proactively purge expired entries
+			c.evictExpired()
+		}
+	}
 }
 
 // Purge removes all entries from the cache.
@@ -100,6 +120,42 @@ func (c *Cache) Purge() {
 	c.entries.Range(func(key, value any) bool {
 		c.entries.Delete(key)
 		return true
+	})
+	c.count.Store(0)
+}
+
+// evictExpired removes expired entries from the cache to release memory.
+func (c *Cache) evictExpired() {
+	now := time.Now()
+	c.entries.Range(func(key, value any) bool {
+		entry := value.(*cacheEntry)
+		if now.After(entry.expireAt) {
+			if _, loaded := c.entries.LoadAndDelete(key); loaded {
+				c.count.Add(-1)
+			}
+		}
+		return true
+	})
+}
+
+func (c *Cache) cleanupLoop() {
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.stopChan:
+			return
+		case <-ticker.C:
+			c.evictExpired()
+		}
+	}
+}
+
+// Stop stops the background cleanup goroutine.
+func (c *Cache) Stop() {
+	c.stopOnce.Do(func() {
+		close(c.stopChan)
 	})
 }
 

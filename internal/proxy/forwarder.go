@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bufio"
+	"crypto/tls"
 	"encoding/base64"
 	"fmt"
 	"io"
@@ -63,6 +64,7 @@ func closeWrite(conn net.Conn) {
 type Forwarder struct {
 	bypassSSPI     bool
 	connectTimeout time.Duration
+	tlsConfig      *tls.Config
 }
 
 // NewForwarder creates a new Forwarder instance.
@@ -76,6 +78,11 @@ func NewForwarder(bypassSSPI bool, connectTimeoutSec int) *Forwarder {
 		bypassSSPI:     bypassSSPI,
 		connectTimeout: timeout,
 	}
+}
+
+// SetTLSConfig sets a custom tls.Config for outbound HTTPS proxy connections.
+func (f *Forwarder) SetTLSConfig(cfg *tls.Config) {
+	f.tlsConfig = cfg
 }
 
 // DialOutbound connects to the target address either directly (if proxyURL is empty)
@@ -107,6 +114,24 @@ func (f *Forwarder) DialOutbound(targetAddr string, proxyURLStr string) (net.Con
 	proxyConn, err := f.dialTCP("tcp", proxyHostPort)
 	if err != nil {
 		return nil, nil, fmt.Errorf("connecting to proxy %s failed: %w", proxyHostPort, err)
+	}
+
+	if proxyURL.Scheme == "https" {
+		var tlsCfg *tls.Config
+		if f.tlsConfig != nil {
+			tlsCfg = f.tlsConfig.Clone()
+		} else {
+			tlsCfg = &tls.Config{}
+		}
+		if tlsCfg.ServerName == "" {
+			tlsCfg.ServerName = proxyURL.Hostname()
+		}
+		tlsConn := tls.Client(proxyConn, tlsCfg)
+		if err := tlsConn.Handshake(); err != nil {
+			_ = proxyConn.Close()
+			return nil, nil, fmt.Errorf("TLS handshake to upstream proxy %s failed: %w", proxyHostPort, err)
+		}
+		proxyConn = tlsConn
 	}
 
 	if f.bypassSSPI {

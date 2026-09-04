@@ -316,5 +316,32 @@ func TestPAC_UpdateConfig_DynamicModes(t *testing.T) {
 	t.Logf("Result after clearing config: IsDirect=%v, ProxyURL=%q", d3.IsDirect, d3.ProxyURL)
 }
 
+func TestParseFirstProxy_Schemes(t *testing.T) {
+	tests := []struct {
+		input       string
+		expected    string
+		expectURL   string
+	}{
+		{"PROXY proxy.corp:8080", "http://proxy.corp:8080", "http://proxy.corp:8080"},
+		{"HTTPS secure-proxy.corp:8443", "https://secure-proxy.corp:8443", "https://secure-proxy.corp:8443"},
+		{"SOCKS5 socks.corp:1080", "socks5://socks.corp:1080", "socks5://socks.corp:1080"},
+		{"SOCKS socks.corp:1080", "socks5://socks.corp:1080", "socks5://socks.corp:1080"},
+		{"DIRECT", "DIRECT", "http://DIRECT"},
+		{"HTTPS p1:8443; PROXY p2:8080; DIRECT", "https://p1:8443", "https://p1:8443"},
+		{"PROXY p2:8080; DIRECT", "http://p2:8080", "http://p2:8080"},
+		{"p3:8080", "p3:8080", "http://p3:8080"},
+	}
 
-
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got := parseFirstProxy(tt.input)
+			if got != tt.expected {
+				t.Errorf("parseFirstProxy(%q) = %q, want %q", tt.input, got, tt.expected)
+			}
+			norm := normalizeProxyURL(got)
+			if norm != tt.expectURL {
+				t.Errorf("normalizeProxyURL(%q) = %q, want %q", got, norm, tt.expectURL)
+			}
+		})
+	}
+}

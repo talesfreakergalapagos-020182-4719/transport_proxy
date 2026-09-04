@@ -69,6 +69,10 @@ func (e *Engine) UpdateRules(mode string, domains []string, ips []string) {
 			continue
 		}
 
+		if strings.HasPrefix(ipStr, "[") && strings.HasSuffix(ipStr, "]") {
+			ipStr = ipStr[1 : len(ipStr)-1]
+		}
+
 		if strings.Contains(ipStr, "/") {
 			// CIDR notation, e.g. "192.168.0.0/16"
 			_, ipNet, err := net.ParseCIDR(ipStr)
@@ -120,6 +124,11 @@ func (e *Engine) match(rs *RuleSet, hostOrIP string) bool {
 		if host, _, err := net.SplitHostPort(hostOrIP); err == nil {
 			hostOrIP = host
 		}
+	}
+
+	// Strip enclosing brackets for bare IPv6 literals without port (e.g. "[2001:db8::1]")
+	if len(hostOrIP) >= 2 && hostOrIP[0] == '[' && hostOrIP[len(hostOrIP)-1] == ']' {
+		hostOrIP = hostOrIP[1 : len(hostOrIP)-1]
 	}
 
 	parsedIP := net.ParseIP(hostOrIP)

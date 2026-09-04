@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/base64"
 	"fmt"
 	"io"
@@ -254,3 +255,60 @@ func TestForwarder_DialOutbound_BasicAuth_ChallengeResponse(t *testing.T) {
 	}
 	_ = conn.Close()
 }
+
+func TestForwarder_DialOutbound_HTTPSProxy(t *testing.T) {
+	// Start an HTTPS proxy mock using httptest.NewTLSServer
+	proxyServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodConnect {
+			hijacker, ok := w.(http.Hijacker)
+			if !ok {
+				http.Error(w, "hijack not supported", http.StatusInternalServerError)
+				return
+			}
+			conn, _, err := hijacker.Hijack()
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+			conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+
+			// Echo simple handshake test
+			buf := make([]byte, 4)
+			if _, err := io.ReadFull(conn, buf); err == nil {
+				conn.Write(buf)
+			}
+			return
+		}
+		http.Error(w, "bad method", http.StatusBadRequest)
+	}))
+	defer proxyServer.Close()
+
+	fwd := NewForwarder(true, 5)
+	// Trust the self-signed cert of proxyServer
+	fwd.SetTLSConfig(&tls.Config{
+		InsecureSkipVerify: true,
+	})
+
+	conn, _, err := fwd.DialOutbound("secured.example.com:443", proxyServer.URL)
+	if err != nil {
+		t.Fatalf("DialOutbound via HTTPS upstream proxy failed: %v", err)
+	}
+	if conn == nil {
+		t.Fatalf("Expected non-nil connection returned")
+	}
+	defer conn.Close()
+
+	// Verify data flow over established tunnel
+	testPayload := []byte("ping")
+	if _, err := conn.Write(testPayload); err != nil {
+		t.Fatalf("Write to tunnel failed: %v", err)
+	}
+	buf := make([]byte, 4)
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		t.Fatalf("Read from tunnel failed: %v", err)
+	}
+	if string(buf) != "ping" {
+		t.Errorf("Expected ping, got %s", string(buf))
+	}
+}
+

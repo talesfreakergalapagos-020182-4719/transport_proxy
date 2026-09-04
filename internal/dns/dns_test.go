@@ -370,3 +370,68 @@ func BenchmarkDNSCache_Get(b *testing.B) {
 		_, _ = cache.Get(dstIP, "github.com", TypeA, uint16(i))
 	}
 }
+
+func TestDNSCache_EvictionAndCap(t *testing.T) {
+	cache := NewCache(5 * time.Second)
+
+	// Test Stop idempotency
+	cache.Stop()
+	cache.Stop() // Should not panic
+
+	// Create fresh cache
+	cache = NewCache(5 * time.Second)
+	defer cache.Stop()
+
+	dstIP := net.ParseIP("1.1.1.2")
+	dummyResp := createTestQuery(0x1111, "expired.com", TypeA)
+	dummyResp[2] = 0x81
+
+	// Store dummy entry
+	cache.Set(dstIP, "expired.com", TypeA, dummyResp)
+	if cache.count.Load() != 1 {
+		t.Fatalf("Expected count 1, got %d", cache.count.Load())
+	}
+
+	// Manually expire entry
+	key := makeCacheKey(dstIP, "expired.com", TypeA)
+	if val, ok := cache.entries.Load(key); ok {
+		entry := val.(*cacheEntry)
+		entry.expireAt = time.Now().Add(-1 * time.Second)
+	}
+
+	// 1. Test lazy eviction on Get
+	_, hit := cache.Get(dstIP, "expired.com", TypeA, 0x1111)
+	if hit {
+		t.Errorf("Expected cache miss for expired entry")
+	}
+	if cache.count.Load() != 0 {
+		t.Errorf("Expected count 0 after lazy eviction, got %d", cache.count.Load())
+	}
+
+	// 2. Test active eviction via evictExpired
+	cache.Set(dstIP, "active-expire.com", TypeA, dummyResp)
+	if cache.count.Load() != 1 {
+		t.Fatalf("Expected count 1, got %d", cache.count.Load())
+	}
+	key2 := makeCacheKey(dstIP, "active-expire.com", TypeA)
+	if val, ok := cache.entries.Load(key2); ok {
+		entry := val.(*cacheEntry)
+		entry.expireAt = time.Now().Add(-1 * time.Second)
+	}
+	cache.evictExpired()
+	if cache.count.Load() != 0 {
+		t.Errorf("Expected count 0 after evictExpired, got %d", cache.count.Load())
+	}
+
+	// 3. Test Purge
+	cache.Set(dstIP, "purge1.com", TypeA, dummyResp)
+	cache.Set(dstIP, "purge2.com", TypeA, dummyResp)
+	if cache.count.Load() != 2 {
+		t.Fatalf("Expected count 2, got %d", cache.count.Load())
+	}
+	cache.Purge()
+	if cache.count.Load() != 0 {
+		t.Errorf("Expected count 0 after Purge, got %d", cache.count.Load())
+	}
+}
+

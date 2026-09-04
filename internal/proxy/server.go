@@ -51,20 +51,24 @@ func AcquireListener(preferredAddr string) (net.Listener, uint16, error) {
 		portStr = "18080"
 	}
 	preferredPort := 18080
-	if p, err := strconv.Atoi(portStr); err == nil && p > 0 && p <= 65535 {
+	if p, err := strconv.Atoi(portStr); err == nil && p >= 0 && p <= 65535 {
 		preferredPort = p
 	}
 
-	hostPrefix := ":"
+	var bindHost string
 	if listenHost != "" && listenHost != "127.0.0.1" && listenHost != "0.0.0.0" && listenHost != "localhost" {
-		hostPrefix = listenHost + ":"
+		bindHost = listenHost
 	}
 
 	// 1. Try preferred port first
-	firstAddr := fmt.Sprintf("%s%d", hostPrefix, preferredPort)
+	firstAddr := net.JoinHostPort(bindHost, strconv.Itoa(preferredPort))
 	listener, err := net.Listen("tcp", firstAddr)
 	if err == nil {
-		return listener, uint16(preferredPort), nil
+		actualPort := uint16(preferredPort)
+		if tcpAddr, ok := listener.Addr().(*net.TCPAddr); ok && actualPort == 0 {
+			actualPort = uint16(tcpAddr.Port)
+		}
+		return listener, actualPort, nil
 	}
 
 	// Preferred port is in use: find who is using it
@@ -95,7 +99,7 @@ func AcquireListener(preferredAddr string) (net.Listener, uint16, error) {
 			continue
 		}
 
-		candidateAddr := fmt.Sprintf("%s%d", hostPrefix, candidatePort)
+		candidateAddr := net.JoinHostPort(bindHost, strconv.Itoa(candidatePort))
 		ln, err := net.Listen("tcp", candidateAddr)
 		if err == nil {
 			log.Printf("[ProxyServer] Successfully switched to alternative listen port %d (Dual-Stack IPv4/IPv6).", candidatePort)
@@ -572,13 +576,17 @@ func (s *Server) handleExplicitProxyClient(ctx context.Context, clientConn net.C
 	}()
 
 	// 4. Forward the initial HTTP request to upstream
-	if proxyToUse == "" {
-		req.RequestURI = ""
-		req.Header.Del("Proxy-Connection")
-	}
+	req.RequestURI = ""
 	_ = outConn.SetWriteDeadline(time.Now().Add(connectTimeout))
-	if err := req.Write(outConn); err != nil {
-		log.Printf("[ERROR] Failed to write HTTP request to upstream %s: %v", targetDisplay, err)
+	var writeErr error
+	if proxyToUse != "" {
+		writeErr = req.WriteProxy(outConn)
+	} else {
+		req.Header.Del("Proxy-Connection")
+		writeErr = req.Write(outConn)
+	}
+	if writeErr != nil {
+		log.Printf("[ERROR] Failed to write HTTP request to upstream %s: %v", targetDisplay, writeErr)
 		return
 	}
 	_ = outConn.SetWriteDeadline(time.Time{})

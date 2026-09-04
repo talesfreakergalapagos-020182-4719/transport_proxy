@@ -65,10 +65,13 @@ func TestEngine_EdgeCases(t *testing.T) {
 		{"192.168.1.50:8000", false, "Allowed IPv4 with port"},
 		{"[2001:db8::1]:8443", false, "Allowed IPv6 bracketed with port"},
 		{"2001:db8::55", false, "Allowed IPv6 bare"},
+		{"[2001:db8::55]", false, "Allowed IPv6 bracketed bare (no port)"},
+		{"[::1]", false, "Allowed IPv6 loopback bracketed bare"},
 
 		// Blocked IPs
 		{"192.169.1.1", true, "IP outside allowed subnet"},
 		{"[2001:db9::1]:443", true, "IPv6 outside allowed prefix"},
+		{"[2001:db9::1]", true, "Blocked IPv6 bracketed bare (no port)"},
 
 		// Degenerate / invalid inputs (should be safely blocked, no panic)
 		{"", true, "Empty input"},
