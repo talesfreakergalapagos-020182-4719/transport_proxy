@@ -263,5 +263,58 @@ function FindProxyForURL(url, host) {
 	}
 }
 
+func TestPAC_AutoDetectExtension(t *testing.T) {
+	// If static proxy URL ends with .pac or .dat or starts with pac+, should be auto-treated as PAC URL
+	cases := []string{
+		"http://wpad.corp.local/wpad.dat",
+		"http://corp.local/proxy.pac",
+		"pac+http://proxy.corp.local/custom",
+	}
+
+	for _, c := range cases {
+		r, err := NewResolver("", c)
+		if err != nil {
+			t.Logf("NewResolver with %q failed (expected if PAC session fails on some envs): %v", c, err)
+			continue
+		}
+		if !r.isPACMode {
+			t.Errorf("Expected isPACMode=true for %q", c)
+		}
+		if r.staticProxy != "" {
+			t.Errorf("Expected staticProxy to be cleared for %q, got %q", c, r.staticProxy)
+		}
+		r.Close()
+	}
+}
+
+func TestPAC_UpdateConfig_DynamicModes(t *testing.T) {
+	// Start with static proxy
+	r, err := NewResolver("", "http://first-proxy:8080")
+	if err != nil {
+		t.Fatalf("NewResolver failed: %v", err)
+	}
+	defer r.Close()
+
+	d1, err := r.Resolve("site1.com", 443)
+	if err != nil || d1.IsDirect || d1.ProxyURL != "http://first-proxy:8080" {
+		t.Errorf("Expected http://first-proxy:8080, got %v (err: %v)", d1, err)
+	}
+
+	// Update to another static proxy
+	r.UpdateConfig("", "http://second-proxy:9090")
+	d2, err := r.Resolve("site1.com", 443)
+	if err != nil || d2.IsDirect || d2.ProxyURL != "http://second-proxy:9090" {
+		t.Errorf("Expected http://second-proxy:9090, got %v (err: %v)", d2, err)
+	}
+
+	// Update to empty -> Direct mode (or auto-detect if OS has it)
+	r.UpdateConfig("", "")
+	d3, err := r.Resolve("site1.com", 443)
+	if err != nil {
+		t.Errorf("Resolve failed after reset: %v", err)
+	}
+	t.Logf("Result after clearing config: IsDirect=%v, ProxyURL=%q", d3.IsDirect, d3.ProxyURL)
+}
+
 
 

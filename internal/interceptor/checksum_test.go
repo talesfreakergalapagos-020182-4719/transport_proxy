@@ -263,6 +263,54 @@ func TestRFC1624_IncrementalChecksum_IPv6(t *testing.T) {
 	}
 }
 
+func TestBuildIPv4UDPPacket_Checksum(t *testing.T) {
+	srcIP := net.ParseIP("1.1.1.2")
+	dstIP := net.ParseIP("192.168.1.100")
+	payload := []byte("Hello DNS IPv4")
+	pkt := BuildIPv4UDPPacket(srcIP, dstIP, 53, 12345, payload)
+
+	if pkt == nil {
+		t.Fatalf("BuildIPv4UDPPacket returned nil")
+	}
+
+	// Verify IPv4 Header checksum
+	expectedIP := fullIPv4Checksum(pkt[:20])
+	actualIP := binary.BigEndian.Uint16(pkt[10:12])
+	if expectedIP != actualIP {
+		t.Errorf("IPv4 Header Checksum mismatch: expected 0x%04x, got 0x%04x", expectedIP, actualIP)
+	}
+
+	// Verify UDP Checksum
+	actualUDP := binary.BigEndian.Uint16(pkt[26:28])
+	if actualUDP == 0 {
+		t.Errorf("UDP checksum must not be 0")
+	}
+	expectedUDP := CalculateUDPChecksumIPv4(srcIP.To4(), dstIP.To4(), pkt[20:])
+	if expectedUDP != actualUDP {
+		t.Errorf("IPv4 UDP Checksum mismatch: expected 0x%04x, got 0x%04x", expectedUDP, actualUDP)
+	}
+}
+
+func TestBuildIPv6UDPPacket_Checksum(t *testing.T) {
+	srcIP := net.ParseIP("2606:4700:4700::1112")
+	dstIP := net.ParseIP("240d:1a:4df:c000:a0de:feec:6e0b:59c4")
+	payload := []byte("Hello DNS IPv6")
+	pkt := BuildIPv6UDPPacket(srcIP, dstIP, 53, 54321, payload)
+
+	if pkt == nil {
+		t.Fatalf("BuildIPv6UDPPacket returned nil")
+	}
+
+	actualUDP := binary.BigEndian.Uint16(pkt[46:48])
+	if actualUDP == 0 {
+		t.Errorf("IPv6 UDP checksum MUST NOT be 0 (RFC 8200)")
+	}
+	expectedUDP := CalculateUDPChecksumIPv6(srcIP.To16(), dstIP.To16(), pkt[40:])
+	if expectedUDP != actualUDP {
+		t.Errorf("IPv6 UDP Checksum mismatch: expected 0x%04x, got 0x%04x", expectedUDP, actualUDP)
+	}
+}
+
 func BenchmarkRewriteIPv4TCP(b *testing.B) {
 	srcIP := [4]byte{192, 168, 1, 100}
 	dstIP := [4]byte{93, 184, 216, 34}

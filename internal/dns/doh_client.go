@@ -113,3 +113,13 @@ func (c *DoHClient) QueryDoH(ctx context.Context, dstIP net.IP, queryWire []byte
 	logger.Debugf("[DoH] Query to %s completed in %v (Response %d bytes)", dohURL, time.Since(startTime).Round(time.Millisecond), len(respBytes))
 	return respBytes, nil
 }
+
+// SetTimeout updates the HTTP client request timeout dynamically.
+func (c *DoHClient) SetTimeout(timeout time.Duration) {
+	if timeout <= 0 {
+		timeout = 3 * time.Second
+	}
+	c.timeout = timeout
+	c.client.Timeout = timeout
+}
+

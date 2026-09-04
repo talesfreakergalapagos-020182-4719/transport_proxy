@@ -4,7 +4,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"os"
@@ -12,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -29,30 +29,54 @@ var (
 	buildTime = "unspecified"
 )
 
-type syncedWriter struct {
-	file *os.File
+type cliOptions struct {
+	configPath string
+	isVerbose  bool
+	isVersion  bool
+	isDryRun   bool
+	logPath    string
+	isCleanup  bool
 }
 
-func (s *syncedWriter) Write(p []byte) (n int, err error) {
-	n, err = s.file.Write(p)
-	_ = s.file.Sync()
-	return n, err
+func parseCLIFlags(args []string) (*cliOptions, error) {
+	fs := flag.NewFlagSet("tproxy", flag.ContinueOnError)
+	configPath := fs.String("c", "config.json", "Path to configuration file")
+	verboseFlag := fs.Bool("v", false, "Enable verbose debug logging")
+	verboseLong := fs.Bool("verbose", false, "Enable verbose debug logging (long)")
+	versionFlag := fs.Bool("version", false, "Show application version")
+	versionShort := fs.Bool("V", false, "Show application version (shorthand)")
+	dryRunFlag := fs.Bool("dry-run", false, "Run in dry-run audit mode (sniff traffic without intercepting/modifying)")
+	dryRunShort := fs.Bool("d", false, "Run in dry-run audit mode (shorthand)")
+	logPathFlag := fs.String("log", "", "Path to output log file (in addition to console)")
+	logPathShort := fs.String("l", "", "Path to output log file (shorthand)")
+	cleanupFlag := fs.Bool("cleanup", false, "Clean up any residual platform redirection rules and exit")
+
+	if err := fs.Parse(args); err != nil {
+		return nil, err
+	}
+
+	logPath := *logPathFlag
+	if logPath == "" {
+		logPath = *logPathShort
+	}
+
+	return &cliOptions{
+		configPath: *configPath,
+		isVerbose:  *verboseFlag || *verboseLong,
+		isVersion:  *versionFlag || *versionShort,
+		isDryRun:   *dryRunFlag || *dryRunShort,
+		logPath:    logPath,
+		isCleanup:  *cleanupFlag,
+	}, nil
 }
 
 func main() {
-	configPath := flag.String("c", "config.json", "Path to configuration file")
-	verboseFlag := flag.Bool("v", false, "Enable verbose debug logging")
-	verboseLong := flag.Bool("verbose", false, "Enable verbose debug logging (long)")
-	versionFlag := flag.Bool("version", false, "Show application version")
-	versionShort := flag.Bool("V", false, "Show application version (shorthand)")
-	dryRunFlag := flag.Bool("dry-run", false, "Run in dry-run audit mode (sniff traffic without intercepting/modifying)")
-	dryRunShort := flag.Bool("d", false, "Run in dry-run audit mode (shorthand)")
-	logPathFlag := flag.String("log", "", "Path to output log file (in addition to console)")
-	logPathShort := flag.String("l", "", "Path to output log file (shorthand)")
-	cleanupFlag := flag.Bool("cleanup", false, "Clean up any residual platform redirection rules and exit")
-	flag.Parse()
+	opts, err := parseCLIFlags(os.Args[1:])
+	if err != nil {
+		os.Exit(2)
+	}
 
-	if *cleanupFlag {
+	if opts.isCleanup {
 		if err := cleanupPlatformRules(); err != nil {
 			fmt.Printf("Error cleaning up platform rules: %v\n", err)
 			os.Exit(1)
@@ -61,24 +85,20 @@ func main() {
 		return
 	}
 
-	if *versionFlag || *versionShort {
+	if opts.isVersion {
 		fmt.Printf("Transparent Proxy Gateway (tproxy) v%s (built %s)\n", version, buildTime)
 		return
 	}
 
-	// Route standard logging to os.Stdout so PowerShell redirection (> or *>) does not trigger NativeCommandError
-	var logOutput io.Writer = os.Stdout
+	logger.SetVerbose(opts.isVerbose)
 
-	isVerbose := *verboseFlag || *verboseLong
-	logger.SetVerbose(isVerbose)
-
-	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-	log.SetOutput(logOutput)
+	// Configure file logging if specified via CLI or config.json
+	cliLogFile := opts.logPath
 
 	// 1. Load configuration
-	absConfigPath, err := filepath.Abs(*configPath)
+	absConfigPath, err := filepath.Abs(opts.configPath)
 	if err != nil {
-		absConfigPath = *configPath
+		absConfigPath = opts.configPath
 	}
 
 	cfgMgr, err := config.NewManager(absConfigPath)
@@ -87,31 +107,39 @@ func main() {
 	}
 	cfg := cfgMgr.Get()
 
-	// Configure file logging if specified via CLI or config.json
-	logFilePath := *logPathFlag
-	if logFilePath == "" {
-		logFilePath = *logPathShort
-	}
-	if logFilePath == "" {
-		logFilePath = cfg.LogFile
-	}
-	if logFilePath != "" {
-		f, err := os.OpenFile(logFilePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
-		if err != nil {
-			log.Printf("[WARNING] Failed to open log file %s: %v", logFilePath, err)
-		} else {
-			defer f.Close()
-			logOutput = io.MultiWriter(os.Stdout, &syncedWriter{file: f})
-			log.SetOutput(logOutput)
-			log.Printf("[Log] Logging to console and file (auto-truncate): %s", logFilePath)
+	var currentLogPath string
+	var logMu sync.Mutex
+
+	setLoggerOutput := func(targetPath string) {
+		logMu.Lock()
+		defer logMu.Unlock()
+
+		if targetPath == currentLogPath && currentLogPath != "" {
+			return
+		}
+		currentLogPath = targetPath
+
+		if err := logger.SetupGlobalLogger(targetPath, true); err != nil {
+			log.Printf("[WARNING] Failed to setup async logger for %s: %v", targetPath, err)
+			return
+		}
+		if targetPath != "" {
+			log.Printf("[Log] Logging to console and file (async buffered): %s", targetPath)
 		}
 	}
+
+	initialLogPath := cliLogFile
+	if initialLogPath == "" {
+		initialLogPath = cfg.LogFile
+	}
+	setLoggerOutput(initialLogPath)
+	defer logger.CloseGlobal()
 
 	log.Printf("================================================================")
 	log.Printf("  Transparent Proxy Gateway v%s starting...", version)
 	log.Printf("================================================================")
 
-	if isVerbose {
+	if opts.isVerbose {
 		log.Printf("[Mode]   VERBOSE Debug Logging is ENABLED.")
 	}
 
@@ -123,7 +151,7 @@ func main() {
 
 	log.Printf("[Config] Loaded configuration from %s", absConfigPath)
 
-	isDryRun := *dryRunFlag || *dryRunShort || cfg.DryRun
+	isDryRun := opts.isDryRun || cfg.DryRun
 	if isDryRun {
 		log.Printf("[Mode]   DRY-RUN (Audit/Monitoring) Mode is ACTIVE.")
 		log.Printf("[Mode]   Traffic will NOT be modified or blocked. Actions will be logged to console.")
@@ -164,36 +192,6 @@ func main() {
 			filterMode, len(activeDomains), len(activeIPs))
 	}
 
-	// Register dynamic reload callback
-	cfgMgr.OnReload(func(newCfg *config.Config) {
-		mode := newCfg.FilterMode
-		if mode == "" {
-			mode = "whitelist"
-		}
-		mLower := strings.ToLower(mode)
-		isAllPassReload := mLower == "none" || mLower == "off" || mLower == "disabled" || mLower == "all" || mLower == "passthrough"
-		var d, ips []string
-		if !isAllPassReload {
-			if mode == "blacklist" {
-				d = newCfg.BlockedDomains
-				ips = newCfg.BlockedIPs
-			} else {
-				d = newCfg.AllowedDomains
-				ips = newCfg.AllowedIPs
-			}
-		}
-		filterEng.UpdateRules(mode, d, ips)
-		pacResolver.UpdateConfig(newCfg.PacURL, newCfg.UpstreamProxy)
-		if isAllPassReload {
-			log.Printf("[Config] Reloaded: ALL-PASS mode (filtering disabled). PAC=%s, Upstream=%s",
-				newCfg.PacURL, newCfg.UpstreamProxy)
-		} else {
-			log.Printf("[Config] Reloaded (%s mode): %d domains, %d IPs. PAC=%s, Upstream=%s",
-				mode, len(d), len(ips), newCfg.PacURL, newCfg.UpstreamProxy)
-		}
-	})
-	cfgMgr.StartAutoReload()
-	defer cfgMgr.Stop()
 
 	// 4. Acquire Proxy Server Listener (with automatic port collision detection & fallback)
 	var proxyListener net.Listener
@@ -234,6 +232,45 @@ func main() {
 	} else if cfg.DohEnabled {
 		log.Printf("[DNS] No custom DNS configured. Using default Cloudflare Security DoH (1.1.1.2 / 1.0.0.2 / 2606:4700:4700::1112 / 2606:4700:4700::1002)")
 	}
+
+	// 5.1 Register dynamic reload callback (expanded hot-reload for filter, proxy, DNS, DoH, dry-run, log file)
+	cfgMgr.OnReload(func(newCfg *config.Config) {
+		mode := newCfg.FilterMode
+		if mode == "" {
+			mode = "whitelist"
+		}
+		mLower := strings.ToLower(mode)
+		isAllPassReload := mLower == "none" || mLower == "off" || mLower == "disabled" || mLower == "all" || mLower == "passthrough"
+		var d, ips []string
+		if !isAllPassReload {
+			if mode == "blacklist" {
+				d = newCfg.BlockedDomains
+				ips = newCfg.BlockedIPs
+			} else {
+				d = newCfg.AllowedDomains
+				ips = newCfg.AllowedIPs
+			}
+		}
+		filterEng.UpdateRules(mode, d, ips)
+		pacResolver.UpdateConfig(newCfg.PacURL, newCfg.UpstreamProxy)
+		dnsEng.UpdateConfig(newCfg)
+		redirector.SetDNSServers(newCfg.DNSServers)
+		redirector.SetDryRun(newCfg.DryRun, forwardCond, filterEng, pacResolver)
+
+		if cliLogFile == "" && newCfg.LogFile != currentLogPath {
+			setLoggerOutput(newCfg.LogFile)
+		}
+
+		if isAllPassReload {
+			log.Printf("[Config] Reloaded: ALL-PASS mode (filtering disabled). PAC=%s, Upstream=%s, DNS=%v, DryRun=%v",
+				newCfg.PacURL, newCfg.UpstreamProxy, newCfg.DNSServers, newCfg.DryRun)
+		} else {
+			log.Printf("[Config] Reloaded (%s mode): %d domains, %d IPs. PAC=%s, Upstream=%s, DNS=%v, DryRun=%v",
+				mode, len(d), len(ips), newCfg.PacURL, newCfg.UpstreamProxy, newCfg.DNSServers, newCfg.DryRun)
+		}
+	})
+	cfgMgr.StartAutoReload()
+	defer cfgMgr.Stop()
 
 	// Panic safety recovery handler to ensure network restoration even on critical failure
 	defer func() {
@@ -305,6 +342,8 @@ func main() {
 
 	// Step 4: Close PAC resolver and config manager (handled by defer)
 	// Step 5: Stop PortGuard and release OS port exclusion (handled by defer)
+	logger.FlushGlobal()
 
 	log.Printf("[Shutdown] Graceful shutdown completed cleanly. Goodbye.")
+	logger.FlushGlobal()
 }

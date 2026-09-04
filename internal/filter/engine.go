@@ -115,8 +115,11 @@ func (e *Engine) ShouldBlock(hostOrIP string) bool {
 
 // match checks if hostOrIP matches the rule set.
 func (e *Engine) match(rs *RuleSet, hostOrIP string) bool {
-	if host, _, err := net.SplitHostPort(hostOrIP); err == nil {
-		hostOrIP = host
+	// Fast path: avoid net.SplitHostPort error allocation if no port/colon is present
+	if strings.IndexByte(hostOrIP, ':') != -1 {
+		if host, _, err := net.SplitHostPort(hostOrIP); err == nil {
+			hostOrIP = host
+		}
 	}
 
 	parsedIP := net.ParseIP(hostOrIP)

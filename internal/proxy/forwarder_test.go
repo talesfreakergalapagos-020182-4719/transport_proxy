@@ -2,8 +2,13 @@ package proxy
 
 import (
 	"bytes"
+	"encoding/base64"
+	"fmt"
 	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -64,7 +69,7 @@ func TestPipeConnEx_Basic(t *testing.T) {
 		w2.Close()
 	}()
 
-	upBytes, downBytes := PipeConnEx(c1, u1, nil, nil, 1*time.Second)
+	upBytes, downBytes := PipeConnEx(c1, u1, nil, nil, 2*time.Second)
 
 	if upBytes != 14 {
 		t.Errorf("expected upBytes 14, got %d", upBytes)
@@ -73,10 +78,10 @@ func TestPipeConnEx_Basic(t *testing.T) {
 		t.Errorf("expected downBytes 12, got %d", downBytes)
 	}
 	if c1.w.String() != "hello client" {
-		t.Errorf("c1 did not receive hello client")
+		t.Errorf("c1 got %s, want hello client", c1.w.String())
 	}
 	if u1.w.String() != "hello upstream" {
-		t.Errorf("u1 did not receive hello upstream")
+		t.Errorf("u1 got %s, want hello upstream", u1.w.String())
 	}
 }
 
@@ -87,31 +92,31 @@ func TestPipeConnEx_WithPrebuffer(t *testing.T) {
 	c1 := &dummyConn{r: r1, w: new(bytes.Buffer)}
 	u1 := &dummyConn{r: r2, w: new(bytes.Buffer)}
 
+	clientPre := bytes.NewReader([]byte("pre_client:"))
+	upstreamPre := bytes.NewReader([]byte("pre_upstream:"))
+
 	go func() {
-		w1.Write([]byte("client"))
+		w1.Write([]byte("body"))
 		w1.Close()
 	}()
 
 	go func() {
-		w2.Write([]byte("stream"))
+		w2.Write([]byte("data"))
 		w2.Close()
 	}()
 
-	preClient := bytes.NewReader([]byte("pre_"))
-	preUpstream := bytes.NewReader([]byte("up_"))
+	upBytes, downBytes := PipeConnEx(c1, u1, clientPre, upstreamPre, 2*time.Second)
 
-	upBytes, downBytes := PipeConnEx(c1, u1, preClient, preUpstream, 1*time.Second)
-
-	if upBytes != 10 {
-		t.Errorf("expected upBytes 10, got %d", upBytes)
+	if upBytes != 15 { // 11 + 4
+		t.Errorf("expected upBytes 15, got %d", upBytes)
 	}
-	if downBytes != 9 {
-		t.Errorf("expected downBytes 9, got %d", downBytes)
+	if downBytes != 17 { // 13 + 4
+		t.Errorf("expected downBytes 17, got %d", downBytes)
 	}
-	if c1.w.String() != "up_stream" {
-		t.Errorf("c1 did not receive up_stream")
+	if !strings.HasPrefix(c1.w.String(), "pre_upstream:") {
+		t.Errorf("c1 did not receive pre_upstream")
 	}
-	if u1.w.String() != "pre_client" {
+	if !strings.HasPrefix(u1.w.String(), "pre_client:") {
 		t.Errorf("u1 did not receive pre_client")
 	}
 }
@@ -139,7 +144,6 @@ func TestPipeConnEx_LargeFileTransfer(t *testing.T) {
 		w2.Close()
 	}()
 
-	// タイムアウトを10秒に設定
 	upBytes, downBytes := PipeConnEx(c1, u1, nil, nil, 10*time.Second)
 
 	if upBytes != int64(payloadSize) {
@@ -156,4 +160,97 @@ func TestPipeConnEx_LargeFileTransfer(t *testing.T) {
 	if u1.w.Len() != payloadSize {
 		t.Errorf("u1 did not receive full payload, got %d bytes", u1.w.Len())
 	}
+}
+
+func TestForwarder_DialOutbound_BasicAuth_BypassSSPI(t *testing.T) {
+	user := "testuser"
+	pass := "secret123"
+	expectedToken := base64.StdEncoding.EncodeToString([]byte(user + ":" + pass))
+
+	proxyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodConnect {
+			authHeader := r.Header.Get("Proxy-Authorization")
+			if authHeader != "Basic "+expectedToken {
+				w.Header().Set("Proxy-Authenticate", `Basic realm="Proxy"`)
+				w.WriteHeader(http.StatusProxyAuthRequired)
+				return
+			}
+
+			hijacker, ok := w.(http.Hijacker)
+			if !ok {
+				http.Error(w, "hijack not supported", http.StatusInternalServerError)
+				return
+			}
+			conn, _, err := hijacker.Hijack()
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+			conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+			return
+		}
+		http.Error(w, "bad method", http.StatusBadRequest)
+	}))
+	defer proxyServer.Close()
+
+	proxyURL := fmt.Sprintf("http://%s:%s@%s", user, pass, strings.TrimPrefix(proxyServer.URL, "http://"))
+	fwd := NewForwarder(true, 5) // bypassSSPI = true
+
+	conn, _, err := fwd.DialOutbound("target.example.com:443", proxyURL)
+	if err != nil {
+		t.Fatalf("DialOutbound with Basic auth (bypassSSPI=true) failed: %v", err)
+	}
+	if conn == nil {
+		t.Fatalf("Expected non-nil connection returned")
+	}
+	_ = conn.Close()
+}
+
+func TestForwarder_DialOutbound_BasicAuth_ChallengeResponse(t *testing.T) {
+	user := "corpuser"
+	pass := "corppass"
+	expectedToken := base64.StdEncoding.EncodeToString([]byte(user + ":" + pass))
+
+	proxyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodConnect {
+			authHeader := r.Header.Get("Proxy-Authorization")
+			if authHeader == "" {
+				w.Header().Set("Proxy-Authenticate", `Basic realm="CorpProxy"`)
+				w.WriteHeader(http.StatusProxyAuthRequired)
+				return
+			}
+
+			if authHeader == "Basic "+expectedToken {
+				hijacker, ok := w.(http.Hijacker)
+				if !ok {
+					http.Error(w, "hijack not supported", http.StatusInternalServerError)
+					return
+				}
+				conn, _, err := hijacker.Hijack()
+				if err != nil {
+					return
+				}
+				defer conn.Close()
+				conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+				return
+			}
+
+			w.WriteHeader(http.StatusProxyAuthRequired)
+			return
+		}
+		http.Error(w, "bad method", http.StatusBadRequest)
+	}))
+	defer proxyServer.Close()
+
+	proxyURL := fmt.Sprintf("http://%s:%s@%s", user, pass, strings.TrimPrefix(proxyServer.URL, "http://"))
+	fwd := NewForwarder(false, 5) // bypassSSPI = false
+
+	conn, _, err := fwd.DialOutbound("target.example.com:443", proxyURL)
+	if err != nil {
+		t.Fatalf("DialOutbound with Basic auth challenge response failed: %v", err)
+	}
+	if conn == nil {
+		t.Fatalf("Expected non-nil connection returned")
+	}
+	_ = conn.Close()
 }

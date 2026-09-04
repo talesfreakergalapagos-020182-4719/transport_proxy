@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bufio"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"net"
@@ -23,6 +24,19 @@ var bufferPool = sync.Pool{
 }
 
 // OptimizeTCPConn tunes TCP socket buffer and low-latency flags.
+var coarsePipeTime atomic.Int64
+
+func init() {
+	coarsePipeTime.Store(time.Now().UnixNano())
+	go func() {
+		ticker := time.NewTicker(20 * time.Millisecond)
+		defer ticker.Stop()
+		for t := range ticker.C {
+			coarsePipeTime.Store(t.UnixNano())
+		}
+	}()
+}
+
 func OptimizeTCPConn(conn net.Conn) {
 	if tc, ok := conn.(*net.TCPConn); ok {
 		_ = tc.SetNoDelay(true)
@@ -96,8 +110,16 @@ func (f *Forwarder) DialOutbound(targetAddr string, proxyURLStr string) (net.Con
 	}
 
 	if f.bypassSSPI {
-		// Standard HTTP CONNECT without SSPI auto-negotiation
-		connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\nProxy-Connection: Keep-Alive\r\n\r\n", targetAddr, targetAddr)
+		// Standard HTTP CONNECT without SSPI auto-negotiation (supports Basic auth if credentials provided)
+		authHeader := ""
+		if proxyURL.User != nil {
+			username := proxyURL.User.Username()
+			password, _ := proxyURL.User.Password()
+			token := base64.StdEncoding.EncodeToString([]byte(username + ":" + password))
+			authHeader = fmt.Sprintf("Proxy-Authorization: Basic %s\r\n", token)
+		}
+
+		connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\nProxy-Connection: Keep-Alive\r\n%s\r\n", targetAddr, targetAddr, authHeader)
 		if _, err := proxyConn.Write([]byte(connectReq)); err != nil {
 			_ = proxyConn.Close()
 			return nil, nil, fmt.Errorf("failed to send CONNECT request: %w", err)
@@ -119,8 +141,8 @@ func (f *Forwarder) DialOutbound(targetAddr string, proxyURLStr string) (net.Con
 		return proxyConn, reader, nil
 	}
 
-	// Full SSPI automatic SSO authentication (Negotiate/NTLM/Kerberos)
-	reader, err := sspi.AuthenticateProxyTunnel(proxyConn, targetAddr, proxyURL.Hostname(), f.connectTimeout)
+	// Automatic authentication (SSPI Windows SSO + Basic auth fallback/native)
+	reader, err := sspi.AuthenticateProxyTunnel(proxyConn, targetAddr, proxyURL, f.connectTimeout)
 	if err != nil {
 		_ = proxyConn.Close()
 		return nil, nil, fmt.Errorf("proxy tunnel authentication failed for %s: %w", proxyHostPort, err)
@@ -162,8 +184,9 @@ func PipeConnEx(c1 net.Conn, c2 net.Conn, clientPreBuffered io.Reader, upstreamP
 	var wg sync.WaitGroup
 	wg.Add(2)
 
+	isPermanent := idleTimeout <= 0
 	var deadlineRefreshInterval time.Duration
-	if idleTimeout <= 0 {
+	if isPermanent {
 		deadlineRefreshInterval = 0
 	} else {
 		deadlineRefreshInterval = idleTimeout / 4
@@ -178,7 +201,7 @@ func PipeConnEx(c1 net.Conn, c2 net.Conn, clientPreBuffered io.Reader, upstreamP
 	c2AddrStr := c2.RemoteAddr().String()
 
 	var lastActivity atomic.Int64
-	lastActivity.Store(time.Now().UnixNano())
+	lastActivity.Store(coarsePipeTime.Load())
 
 	// 1. Upstream -> Client (c2 -> c1)
 	go func() {
@@ -209,11 +232,10 @@ func PipeConnEx(c1 net.Conn, c2 net.Conn, clientPreBuffered io.Reader, upstreamP
 		buf := *bufPtr
 
 		if logger.IsVerbose() { logger.Debugf("[PIPE-DOWN] Started: Upstream (%s) -> Client (%s)", c2AddrStr, c1AddrStr) }
-		firstRead := true
 		
 		var lastDeadline time.Time
 		updateDeadline := func(nowNano int64) {
-			if idleTimeout > 0 {
+			if !isPermanent {
 				now := time.Unix(0, nowNano)
 				if now.Sub(lastDeadline) > deadlineRefreshInterval {
 					_ = c2.SetReadDeadline(now.Add(idleTimeout))
@@ -221,22 +243,18 @@ func PipeConnEx(c1 net.Conn, c2 net.Conn, clientPreBuffered io.Reader, upstreamP
 				}
 			}
 		}
-		updateDeadline(time.Now().UnixNano())
+	if !isPermanent {
+		updateDeadline(coarsePipeTime.Load())
+	}
 
 		for {
-			if firstRead {
-				if logger.IsVerbose() { logger.Debugf("[PIPE-DOWN] Waiting for first byte from upstream %s...", c2AddrStr) }
-			}
 			nr, er := src.Read(buf)
-			if firstRead {
-				if logger.IsVerbose() { logger.Debugf("[PIPE-DOWN] First read result from upstream %s: read=%d bytes, err=%v", c2AddrStr, nr, er) }
-				firstRead = false
-			}
 			if nr > 0 {
-				now := time.Now().UnixNano()
+				now := coarsePipeTime.Load()
 				lastActivity.Store(now)
-				updateDeadline(now)
-				if logger.IsVerbose() { logger.Debugf("[PIPE-DOWN] Received %d bytes from upstream %s -> Writing to client %s", nr, c2AddrStr, c1AddrStr) }
+				if !isPermanent {
+					updateDeadline(now)
+				}
 				nw, ew := c1.Write(buf[0:nr])
 				if nw > 0 {
 					localBytes += int64(nw)
@@ -306,7 +324,7 @@ func PipeConnEx(c1 net.Conn, c2 net.Conn, clientPreBuffered io.Reader, upstreamP
 		
 		var lastDeadline time.Time
 		updateDeadline := func(nowNano int64) {
-			if idleTimeout > 0 {
+			if !isPermanent {
 				now := time.Unix(0, nowNano)
 				if now.Sub(lastDeadline) > deadlineRefreshInterval {
 					_ = c1.SetReadDeadline(now.Add(idleTimeout))
@@ -314,15 +332,18 @@ func PipeConnEx(c1 net.Conn, c2 net.Conn, clientPreBuffered io.Reader, upstreamP
 				}
 			}
 		}
-		updateDeadline(time.Now().UnixNano())
+		if !isPermanent {
+			updateDeadline(coarsePipeTime.Load())
+		}
 
 		for {
 			nr, er := clientSrc.Read(buf)
 			if nr > 0 {
-				now := time.Now().UnixNano()
+				now := coarsePipeTime.Load()
 				lastActivity.Store(now)
-				updateDeadline(now)
-				if logger.IsVerbose() { logger.Debugf("[PIPE-UP] Received %d bytes from client %s -> Forwarding to upstream %s", nr, c1AddrStr, c2AddrStr) }
+				if !isPermanent {
+					updateDeadline(now)
+				}
 				nw, ew := c2.Write(buf[0:nr])
 				if nw > 0 {
 					localBytes += int64(nw)

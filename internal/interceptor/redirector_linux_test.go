@@ -38,3 +38,12 @@ func TestLinuxRedirector_LookupOriginalDestinationConn_Nil(t *testing.T) {
 		t.Errorf("Expected not found on nil conn, got ip=%v, port=%d, found=%v", ip, port, found)
 	}
 }
+
+func TestLinuxRedirector_SetDNSServers(t *testing.T) {
+	r := &Redirector{}
+	r.SetDNSServers([]string{"1.1.1.1", "8.8.8.8"})
+	if len(r.dnsServers) != 2 || r.dnsServers[0] != "1.1.1.1" {
+		t.Errorf("Expected dnsServers to be set, got %v", r.dnsServers)
+	}
+}
+

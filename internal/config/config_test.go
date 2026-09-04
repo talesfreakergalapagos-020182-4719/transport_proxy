@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestConfigLoadAndDefaults(t *testing.T) {
@@ -225,4 +227,170 @@ func TestConfig_CorporateProxySettings(t *testing.T) {
 		})
 	}
 }
+
+func TestConfig_HotReload_DynamicFields(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "config.json")
+	initialJSON := `{
+		"filter_mode": "whitelist",
+		"allowed_domains": ["example.com"],
+		"dns_servers": ["8.8.8.8"],
+		"doh_timeout_sec": 3,
+		"reload_interval_sec": 5,
+		"log_file": "old.log"
+	}`
+	if err := os.WriteFile(cfgPath, []byte(initialJSON), 0644); err != nil {
+		t.Fatalf("failed to write initial config: %v", err)
+	}
+
+	mgr, err := NewManager(cfgPath)
+	if err != nil {
+		t.Fatalf("NewManager failed: %v", err)
+	}
+	defer mgr.Stop()
+
+	reloaded := make(chan *Config, 1)
+	mgr.OnReload(func(newCfg *Config) {
+		reloaded <- newCfg
+	})
+
+	// Update file with new parameters
+	updatedJSON := `{
+		"filter_mode": "blacklist",
+		"allowed_domains": [],
+		"blocked_domains": ["bad.com"],
+		"dns_servers": ["1.1.1.1", "1.0.0.1"],
+		"doh_timeout_sec": 8,
+		"reload_interval_sec": 2,
+		"log_file": "new.log"
+	}`
+	// Ensure file modification time is in the future for drvfs/9p/NTFS cross-platform compatibility
+	if err := os.WriteFile(cfgPath, []byte(updatedJSON), 0644); err != nil {
+		t.Fatalf("failed to write updated config: %v", err)
+	}
+	futureTime := time.Now().Add(2 * time.Second)
+	_ = os.Chtimes(cfgPath, futureTime, futureTime)
+
+	mgr.checkAndReload()
+
+	select {
+	case newCfg := <-reloaded:
+		if newCfg.FilterMode != "blacklist" {
+			t.Errorf("Expected filter_mode 'blacklist', got %q", newCfg.FilterMode)
+		}
+		if len(newCfg.DNSServers) != 2 || newCfg.DNSServers[0] != "1.1.1.1" {
+			t.Errorf("Expected dns_servers [1.1.1.1, 1.0.0.1], got %v", newCfg.DNSServers)
+		}
+		if newCfg.DohTimeoutSec != 8 {
+			t.Errorf("Expected doh_timeout_sec 8, got %d", newCfg.DohTimeoutSec)
+		}
+		if newCfg.ReloadIntervalSec != 2 {
+			t.Errorf("Expected reload_interval_sec 2, got %d", newCfg.ReloadIntervalSec)
+		}
+		if newCfg.LogFile != "new.log" {
+			t.Errorf("Expected log_file 'new.log', got %q", newCfg.LogFile)
+		}
+	default:
+		t.Fatalf("OnReload callback was not triggered on checkAndReload")
+	}
+}
+
+func TestConfig_SampleFileValidation(t *testing.T) {
+	// Locate config.json.sample in project root
+	samplePath := filepath.Join("..", "..", "config.json.sample")
+	mgr, err := NewManager(samplePath)
+	if err != nil {
+		t.Fatalf("Failed to parse config.json.sample: %v", err)
+	}
+	defer mgr.Stop()
+
+	cfg := mgr.Get()
+	if cfg.ListenAddr != "0.0.0.0:18080" {
+		t.Errorf("Expected listen_addr 0.0.0.0:18080, got %q", cfg.ListenAddr)
+	}
+	if cfg.FilterMode != "whitelist" {
+		t.Errorf("Expected filter_mode whitelist, got %q", cfg.FilterMode)
+	}
+	if !cfg.DohEnabled {
+		t.Errorf("Expected doh_enabled true, got %v", cfg.DohEnabled)
+	}
+	if cfg.DohTimeoutSec != 3 {
+		t.Errorf("Expected doh_timeout_sec 3, got %d", cfg.DohTimeoutSec)
+	}
+	if !cfg.FallbackToUDP {
+		t.Errorf("Expected fallback_to_udp true, got %v", cfg.FallbackToUDP)
+	}
+	if !cfg.DNSCacheEnabled {
+		t.Errorf("Expected dns_cache_enabled true, got %v", cfg.DNSCacheEnabled)
+	}
+	if cfg.DNSCacheTTLSec != 300 {
+		t.Errorf("Expected dns_cache_ttl_sec 300, got %d", cfg.DNSCacheTTLSec)
+	}
+	if cfg.ConnectTimeoutSec != 10 {
+		t.Errorf("Expected connect_timeout_sec 10, got %d", cfg.ConnectTimeoutSec)
+	}
+	if cfg.IdleTimeoutSec != 60 {
+		t.Errorf("Expected idle_timeout_sec 60, got %d", cfg.IdleTimeoutSec)
+	}
+	if cfg.ReloadIntervalSec != 5 {
+		t.Errorf("Expected reload_interval_sec 5, got %d", cfg.ReloadIntervalSec)
+	}
+}
+
+func TestConfig_GetEffectiveDNSServers(t *testing.T) {
+	// 1. Default fallback to Cloudflare Security DNS
+	cfgDefault := DefaultConfig()
+	effective := cfgDefault.GetEffectiveDNSServers()
+	if len(effective) != 4 {
+		t.Fatalf("Expected 4 default DNS servers (2 IPv4 + 2 IPv6), got %d", len(effective))
+	}
+	if effective[0] != "1.1.1.2" || effective[1] != "1.0.0.2" {
+		t.Errorf("Unexpected IPv4 default servers: %v", effective[:2])
+	}
+	if cfgDefault.IsCustomDNS() {
+		t.Errorf("Expected IsCustomDNS() to be false for default config")
+	}
+
+	// 2. Custom DNS overrides defaults
+	cfgCustom := DefaultConfig()
+	cfgCustom.DNSServers = []string{"169.254.169.254", "10.0.0.2"}
+	effectiveCustom := cfgCustom.GetEffectiveDNSServers()
+	if len(effectiveCustom) != 2 || effectiveCustom[0] != "169.254.169.254" {
+		t.Errorf("Unexpected custom DNS servers: %v", effectiveCustom)
+	}
+	if !cfgCustom.IsCustomDNS() {
+		t.Errorf("Expected IsCustomDNS() to be true for custom config")
+	}
+}
+
+func TestConfig_BuildDivertFilter_EdgeCases(t *testing.T) {
+	// 1. Custom DivertFilter specified in config must take precedence
+	cfgCustomFilter := DefaultConfig()
+	cfgCustomFilter.DivertFilter = "outbound and tcp.DstPort == 80"
+	fwdStr, _ := cfgCustomFilter.BuildDivertFilter(18080)
+	if fwdStr != "outbound and tcp.DstPort == 80" {
+		t.Errorf("Expected custom DivertFilter to be used directly, got: %q", fwdStr)
+	}
+
+	// 2. Default filter with empty dns_servers includes DNS (udp.DstPort == 53)
+	cfgDefault := DefaultConfig()
+	_, filterDefault := cfgDefault.BuildDivertFilter(18080)
+	if !strings.Contains(filterDefault, "udp.DstPort == 53") {
+		t.Errorf("Expected default filter to include DNS capture, got: %s", filterDefault)
+	}
+	if !strings.Contains(filterDefault, "40000") || !strings.Contains(filterDefault, "48999") {
+		t.Errorf("Expected PortGuard exclusion range (40000-48999) in filter, got: %s", filterDefault)
+	}
+
+	// 3. Custom DNS servers specified: DNS capture (udp.DstPort == 53) must be excluded
+	cfgWithDNS := DefaultConfig()
+	cfgWithDNS.DNSServers = []string{"10.0.0.1"}
+	_, filterWithDNS := cfgWithDNS.BuildDivertFilter(18080)
+	if strings.Contains(filterWithDNS, "udp.DstPort == 53") {
+		t.Errorf("Expected custom DNS config to NOT capture DNS in WinDivert filter, got: %s", filterWithDNS)
+	}
+}
+
+
+
 

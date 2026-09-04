@@ -44,9 +44,11 @@ type Redirector struct {
 	sessions       sync.Map // map[SessionKey]*SessionInfo
 	dryRunSessions sync.Map // map[SessionKey]*dryRunSessionInfo for deduplicating dry-run audit logs
 	dryRun         bool
+	sniffMode      bool
 	filterEng      FilterEvaluator
 	routingEng     RoutingEvaluator
 	dnsEng         DNSEvaluator
+	savedDNSEng    DNSEvaluator
 	coarseNano     atomic.Int64
 	dnsQueue       chan dnsTask
 	mu             sync.Mutex
@@ -124,6 +126,7 @@ func (r *Redirector) SetDNSEngine(dnsEng DNSEvaluator) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.dnsEng = dnsEng
+	r.savedDNSEng = dnsEng
 }
 
 // SetDNSServers configures custom upstream DNS servers.
@@ -133,6 +136,9 @@ func (r *Redirector) SetDNSServers(dnsServers []string) {
 	if len(dnsServers) > 0 {
 		// Custom DNS is configured: allow direct bypass by disabling DNS interception
 		r.dnsEng = nil
+	} else {
+		// Default mode: restore DNS interception engine
+		r.dnsEng = r.savedDNSEng
 	}
 }
 
@@ -148,6 +154,7 @@ func (r *Redirector) Start(ctx context.Context) error {
 	var flags uint64
 	if r.dryRun {
 		flags = WINDIVERT_FLAG_SNIFF
+		r.sniffMode = true
 		log.Printf("[Redirector] Dry-Run Mode ENABLED: Passively sniffing outbound traffic without interception.")
 	}
 
@@ -249,8 +256,12 @@ func (r *Redirector) processDNSTask(ctx context.Context, task dnsTask) {
 			injectAddr.SetOutbound(false) // Inbound to client
 			injectAddr.Flags |= WINDIVERT_ADDRESS_FLAG_IMPOSTOR
 			injectAddr.Flags &^= WINDIVERT_ADDRESS_FLAG_LOOPBACK
-			_ = r.dll.CalcChecksums(respPkt, &injectAddr, 0)
-			_, _ = r.dll.Send(r.handle, respPkt, &injectAddr)
+			// Clear hardware offload checksum flags so OS accepts our precalculated RFC checksums
+			injectAddr.Flags &^= (WINDIVERT_ADDRESS_FLAG_IP_CHECKSUM | WINDIVERT_ADDRESS_FLAG_TCP_CHECKSUM | WINDIVERT_ADDRESS_FLAG_UDP_CHECKSUM)
+			_, sendErr := r.dll.Send(r.handle, respPkt, &injectAddr)
+			if sendErr != nil {
+				logger.Debugf("[DNS] Send DNS response failed: %v", sendErr)
+			}
 		}
 	}
 }
@@ -352,6 +363,9 @@ func (r *Redirector) packetLoop(ctx context.Context, workerID int) {
 									payload = rawPacket[payloadOffset:]
 								}
 								r.handleDryRunTCP(clientKey, net.IPv4(dstIP[0], dstIP[1], dstIP[2], dstIP[3]), dstPort, payload)
+								if !r.sniffMode {
+									_, _ = r.dll.Send(r.handle, rawPacket, &addr)
+								}
 								continue
 							}
 
@@ -376,13 +390,9 @@ func (r *Redirector) packetLoop(ctx context.Context, workerID int) {
 								clientKey := MakeSessionKeyIPv4(dstIP, dstPort)
 								if val, exists := r.sessions.Load(clientKey); exists {
 									info := val.(*SessionInfo)
-									info.LastSeen.Store(nowNano) // Keep alive during active traffic
-
-									logger.Debugf("[RNAT]  Reverse NAT: %d.%d.%d.%d:%d -> %d.%d.%d.%d:%d (pktLen=%d, IfIdx=%d, Flags=0x%x, Loopback=%v) -> Rewrite Src to %s:%d",
-										srcIP[0], srcIP[1], srcIP[2], srcIP[3], srcPort,
-										dstIP[0], dstIP[1], dstIP[2], dstIP[3], dstPort,
-										len(rawPacket), addr.IfIdx, addr.Flags, addr.IsLoopback(),
-										info.OriginalDstIP, info.OriginalDstPort)
+									if nowNano-info.LastSeen.Load() > 1_000_000_000 {
+										info.LastSeen.Store(nowNano)
+									}
 
 									_ = RewriteIPv4TCP(rawPacket, info.OriginalDstIP, nil, info.OriginalDstPort, 0)
 									addr.SetOutbound(false)                                  // Inbound to client TCP stack
@@ -395,12 +405,9 @@ func (r *Redirector) packetLoop(ctx context.Context, workerID int) {
 									// Handle LSO packets that exceed physical MTU (1500)
 									fragments := FragmentIPv4(rawPacket, 1500)
 									for i, frag := range fragments {
-										sentLen, sendErr := r.dll.Send(r.handle, frag, &addr)
+										_, sendErr := r.dll.Send(r.handle, frag, &addr)
 										if sendErr != nil {
 											logger.Debugf("[RNAT]  Send failed: frag %d/%d (len=%d): %v", i+1, len(fragments), len(frag), sendErr)
-										} else {
-											logger.Debugf("[RNAT]  Sent frag %d/%d (len=%d, sentLen=%d, IfIdx=%d, Flags=0x%x)",
-												i+1, len(fragments), len(frag), sentLen, addr.IfIdx, addr.Flags)
 										}
 									}
 									continue // Skip standard Send at bottom
@@ -530,6 +537,9 @@ func (r *Redirector) packetLoop(ctx context.Context, workerID int) {
 									payload = rawPacket[payloadOffset:]
 								}
 								r.handleDryRunTCP(clientKey, net.IP(dstIP6[:]), dstPort, payload)
+								if !r.sniffMode {
+									_, _ = r.dll.Send(r.handle, rawPacket, &addr)
+								}
 								continue
 							}
 
@@ -555,10 +565,6 @@ func (r *Redirector) packetLoop(ctx context.Context, workerID int) {
 									info := val.(*SessionInfo)
 									info.LastSeen.Store(nowNano)
 
-									logger.Debugf("[RNAT-v6] Reverse NAT: [%s]:%d -> [%s]:%d -> Rewrite Src to [%s]:%d",
-										net.IP(srcIP6[:]), srcPort, net.IP(dstIP6[:]), dstPort,
-										info.OriginalDstIP, info.OriginalDstPort)
-
 									_ = RewriteIPv6TCP(rawPacket, info.OriginalDstIP, nil, info.OriginalDstPort, 0)
 									addr.SetOutbound(false)                                  // Inbound to client TCP stack
 									addr.Flags &^= WINDIVERT_ADDRESS_FLAG_LOOPBACK           // Clear loopback flag
@@ -568,26 +574,20 @@ func (r *Redirector) packetLoop(ctx context.Context, workerID int) {
 									_ = r.dll.CalcChecksums(rawPacket, &addr, 0)
 
 									if len(rawPacket) > 1280 {
-										sentLen, sendErr := r.dll.Send(r.handle, rawPacket, &addr)
+										_, sendErr := r.dll.Send(r.handle, rawPacket, &addr)
 										if sendErr != nil {
 											fragments := FragmentIPv6TCP(rawPacket, 1280)
 											for i, frag := range fragments {
-												sLen, sErr := r.dll.Send(r.handle, frag, &addr)
+												_, sErr := r.dll.Send(r.handle, frag, &addr)
 												if sErr != nil {
 													logger.Debugf("[RNAT-v6] Send failed: frag %d/%d (len=%d): %v", i+1, len(fragments), len(frag), sErr)
-												} else {
-													logger.Debugf("[RNAT-v6] Sent frag %d/%d (len=%d, sentLen=%d, IfIdx=%d)", i+1, len(fragments), len(frag), sLen, addr.IfIdx)
 												}
 											}
-										} else {
-											logger.Debugf("[RNAT-v6] Sent len=%d, sentLen=%d, IfIdx=%d", len(rawPacket), sentLen, addr.IfIdx)
 										}
 									} else {
-										sentLen, sendErr := r.dll.Send(r.handle, rawPacket, &addr)
+										_, sendErr := r.dll.Send(r.handle, rawPacket, &addr)
 										if sendErr != nil {
 											logger.Debugf("[RNAT-v6] Send failed (len=%d): %v", len(rawPacket), sendErr)
-										} else {
-											logger.Debugf("[RNAT-v6] Sent len=%d, sentLen=%d, IfIdx=%d", len(rawPacket), sentLen, addr.IfIdx)
 										}
 									}
 									continue

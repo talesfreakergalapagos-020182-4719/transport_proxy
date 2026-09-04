@@ -184,6 +184,98 @@ func TestEngine_PolicyBlock(t *testing.T) {
 	}
 }
 
+func TestEngine_UpdateConfig(t *testing.T) {
+	tempDir := t.TempDir()
+	configPath := filepath.Join(tempDir, "config.json")
+	_ = os.WriteFile(configPath, []byte(`{
+		"doh_enabled": true,
+		"doh_timeout_sec": 3,
+		"dns_cache_enabled": true,
+		"dns_cache_ttl_sec": 300
+	}`), 0644)
+
+	mgr, err := config.NewManager(configPath)
+	if err != nil {
+		t.Fatalf("NewManager failed: %v", err)
+	}
+	defer mgr.Stop()
+
+	eng := NewEngine(mgr, nil, nil)
+
+	// Populate cache with an entry
+	dstIP := net.ParseIP("1.1.1.2")
+	dummyResp := createTestQuery(0x1111, "example.com", TypeA)
+	dummyResp[2] = 0x81
+	eng.cache.Set(dstIP, "example.com", TypeA, dummyResp)
+
+	// Verify cache hit
+	if _, hit := eng.cache.Get(dstIP, "example.com", TypeA, 0x1111); !hit {
+		t.Fatalf("Expected cache hit before update")
+	}
+
+	// UpdateConfig with dns_cache_enabled: false (should purge cache) and doh_timeout_sec: 7
+	newCfg := &config.Config{
+		DohEnabled:      true,
+		DohTimeoutSec:   7,
+		DNSCacheEnabled: false,
+		DNSCacheTTLSec:  60,
+	}
+	eng.UpdateConfig(newCfg)
+
+	if eng.dohClient.timeout != 7*time.Second {
+		t.Errorf("Expected DoH client timeout 7s, got %v", eng.dohClient.timeout)
+	}
+
+	// Verify cache was purged
+	if _, hit := eng.cache.Get(dstIP, "example.com", TypeA, 0x1111); hit {
+		t.Errorf("Expected cache to be purged when DNSCacheEnabled is false")
+	}
+
+	// UpdateConfig again enabling cache with new TTL
+	newCfg2 := &config.Config{
+		DohEnabled:      true,
+		DohTimeoutSec:   5,
+		DNSCacheEnabled: true,
+		DNSCacheTTLSec:  120,
+	}
+	eng.UpdateConfig(newCfg2)
+	if eng.cache.maxTTL != 120*time.Second {
+		t.Errorf("Expected cache maxTTL 120s, got %v", eng.cache.maxTTL)
+	}
+}
+
+func TestDoHClient_SetTimeout(t *testing.T) {
+	client := NewDoHClient(3*time.Second, nil)
+	client.SetTimeout(8 * time.Second)
+	if client.timeout != 8*time.Second {
+		t.Errorf("Expected timeout 8s, got %v", client.timeout)
+	}
+	if client.client.Timeout != 8*time.Second {
+		t.Errorf("Expected http.Client timeout 8s, got %v", client.client.Timeout)
+	}
+
+	// Zero or negative should fallback to 3s default
+	client.SetTimeout(0)
+	if client.timeout != 3*time.Second {
+		t.Errorf("Expected default timeout 3s, got %v", client.timeout)
+	}
+}
+
+func TestCache_SetMaxTTL(t *testing.T) {
+	cache := NewCache(300 * time.Second)
+	cache.SetMaxTTL(60 * time.Second)
+	if cache.maxTTL != 60*time.Second {
+		t.Errorf("Expected maxTTL 60s, got %v", cache.maxTTL)
+	}
+
+	// Zero or negative should fallback to 300s default
+	cache.SetMaxTTL(-1)
+	if cache.maxTTL != 300*time.Second {
+		t.Errorf("Expected default maxTTL 300s, got %v", cache.maxTTL)
+	}
+}
+
+
 func BenchmarkDNSCache_Get(b *testing.B) {
 	cache := NewCache(10 * time.Minute)
 	dstIP := net.ParseIP("1.1.1.2")

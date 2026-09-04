@@ -102,3 +102,12 @@ func (c *Cache) Purge() {
 		return true
 	})
 }
+
+// SetMaxTTL updates the maximum TTL for future cached responses.
+func (c *Cache) SetMaxTTL(maxTTL time.Duration) {
+	if maxTTL <= 0 {
+		maxTTL = 300 * time.Second
+	}
+	c.maxTTL = maxTTL
+}
+

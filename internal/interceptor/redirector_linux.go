@@ -85,11 +85,18 @@ func (r *Redirector) SetDNSEngine(dnsEng DNSEvaluator) {
 	r.dnsEng = dnsEng
 }
 
-// SetDNSServers configures custom upstream DNS servers.
+// SetDNSServers configures custom upstream DNS servers and updates iptables rules if active.
 func (r *Redirector) SetDNSServers(dnsServers []string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.dnsServers = dnsServers
+	if r.rulesApplied && !r.closed {
+		if err := r.applyIPTablesRules(); err != nil {
+			log.Printf("[Redirector] Warning: Failed to re-apply iptables rules for updated DNS servers: %v", err)
+		} else {
+			log.Printf("[Redirector] Successfully updated iptables rules for DNS servers: %v", dnsServers)
+		}
+	}
 }
 
 // Start applies iptables redirection rules and starts local DNS interceptor.

@@ -23,6 +23,7 @@ type Engine struct {
 	probeMgr   *ProbeManager
 	cache      *Cache
 	pacResolve ProxyDecisionResolver
+	coalesce   *CoalesceGroup
 }
 
 // NewEngine creates and initializes the DNS interception engine.
@@ -49,6 +50,7 @@ func NewEngine(cfgMgr *config.Manager, filterEng FilterEvaluator, pacResolver Pr
 		probeMgr:   probeMgr,
 		cache:      cache,
 		pacResolve: pacResolver,
+		coalesce:   NewCoalesceGroup(),
 	}
 
 	return eng
@@ -100,9 +102,11 @@ func (e *Engine) ProcessDNSQuery(ctx context.Context, clientAddr net.Addr, dstIP
 		return nil, true // Passthrough to normal UDP 53
 	}
 
-	// 6. Execute DoH Query (HTTPS POST application/dns-message)
+	// 6. Execute DoH Query with Query Coalescing (Singleflight) to deduplicate simultaneous bursts
 	startTime := time.Now()
-	dohResp, dohErr := e.dohClient.QueryDoH(ctx, dstIP, payload)
+	dohResp, shared, dohErr := e.coalesce.Do(dstIP, qname, qtype, func() ([]byte, error) {
+		return e.dohClient.QueryDoH(ctx, dstIP, payload)
+	})
 	duration := time.Since(startTime).Round(time.Millisecond)
 
 	if dohErr != nil {
@@ -115,19 +119,52 @@ func (e *Engine) ProcessDNSQuery(ctx context.Context, clientAddr net.Addr, dstIP
 		return BuildErrorResponse(payload, RCodeServFail), false
 	}
 
-	// Match client transaction ID
-	if len(dohResp) >= 2 {
-		dohResp[0] = payload[0]
-		dohResp[1] = payload[1]
-	}
-
-	// Store in cache
-	if e.cache != nil && cfg.DNSCacheEnabled {
+	// Store original clean dohResp in cache before ID modification
+	if !shared && e.cache != nil && cfg.DNSCacheEnabled {
 		e.cache.Set(dstIP, qname, qtype, dohResp)
 	}
 
-	log.Printf("[ALLOW] DNS-DoH | Client: %-21s | Target: %-30s | Query: %-25s (%s) -> DoH (%v)",
-		clientAddr.String(), targetDisplay, qname, typeStr, duration)
+	// Return defensive copy matching client transaction ID to prevent race condition across coalesced callers
+	clientResp := append([]byte(nil), dohResp...)
+	if len(clientResp) >= 2 {
+		clientResp[0] = payload[0]
+		clientResp[1] = payload[1]
+	}
 
-	return dohResp, false
+	tag := "DoH"
+	if shared {
+		tag = "DoH-Coalesced"
+	}
+	log.Printf("[ALLOW] DNS-DoH | Client: %-21s | Target: %-30s | Query: %-25s (%s) -> %s (%v)",
+		clientAddr.String(), targetDisplay, qname, typeStr, tag, duration)
+
+	return clientResp, false
 }
+
+// UpdateConfig dynamically updates DoH client timeouts and cache parameters on config reload.
+func (e *Engine) UpdateConfig(newCfg *config.Config) {
+	if newCfg == nil {
+		return
+	}
+
+	dohTimeout := time.Duration(newCfg.DohTimeoutSec) * time.Second
+	if dohTimeout <= 0 {
+		dohTimeout = 3 * time.Second
+	}
+	if e.dohClient != nil {
+		e.dohClient.SetTimeout(dohTimeout)
+	}
+
+	if e.cache != nil {
+		if !newCfg.DNSCacheEnabled {
+			e.cache.Purge()
+		} else {
+			ttl := time.Duration(newCfg.DNSCacheTTLSec) * time.Second
+			e.cache.SetMaxTTL(ttl)
+		}
+	} else if newCfg.DNSCacheEnabled {
+		ttl := time.Duration(newCfg.DNSCacheTTLSec) * time.Second
+		e.cache = NewCache(ttl)
+	}
+}
+

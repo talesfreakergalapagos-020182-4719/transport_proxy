@@ -819,23 +819,28 @@ func BuildIPv4UDPPacket(srcIP, dstIP net.IP, srcPort, dstPort uint16, payload []
 	binary.BigEndian.PutUint16(pkt[6:8], 0x4000) // Flags: Don't Fragment (DF)
 	pkt[8] = 64                                  // TTL = 64
 	pkt[9] = IPPROTO_UDP                         // Protocol = UDP (17)
-	// Checksum at 10:12 calculated by WinDivert CalcChecksums
 	copy(pkt[12:16], src4)
 	copy(pkt[16:20], dst4)
+	// Calculate IPv4 Header Checksum
+	ipCsum := CalculateIPv4HeaderChecksum(pkt[:ipHdrLen])
+	binary.BigEndian.PutUint16(pkt[10:12], ipCsum)
 
 	// UDP Header
 	binary.BigEndian.PutUint16(pkt[20:22], srcPort)
 	binary.BigEndian.PutUint16(pkt[22:24], dstPort)
 	binary.BigEndian.PutUint16(pkt[24:26], uint16(udpHdrLen+len(payload)))
-	pkt[26] = 0
-	pkt[27] = 0
 
 	// Payload
 	copy(pkt[28:], payload)
+
+	// Calculate RFC 768 UDP Checksum (Pseudo-header + UDP header + payload)
+	udpCsum := CalculateUDPChecksumIPv4(src4, dst4, pkt[ipHdrLen:])
+	binary.BigEndian.PutUint16(pkt[26:28], udpCsum)
+
 	return pkt
 }
 
-// BuildIPv6UDPPacket constructs a full IPv6 UDP packet ready for WinDivert checksum calculation and injection.
+// BuildIPv6UDPPacket constructs a full IPv6 UDP packet with valid RFC 8200 checksum.
 func BuildIPv6UDPPacket(srcIP, dstIP net.IP, srcPort, dstPort uint16, payload []byte) []byte {
 	src16 := srcIP.To16()
 	dst16 := dstIP.To16()
@@ -864,11 +869,96 @@ func BuildIPv6UDPPacket(srcIP, dstIP net.IP, srcPort, dstPort uint16, payload []
 	binary.BigEndian.PutUint16(pkt[40:42], srcPort)
 	binary.BigEndian.PutUint16(pkt[42:44], dstPort)
 	binary.BigEndian.PutUint16(pkt[44:46], uint16(payloadLen))
-	pkt[46] = 0
-	pkt[47] = 0
 
 	// Payload
 	copy(pkt[48:], payload)
+
+	// Calculate RFC 8200 IPv6 UDP Checksum (Mandatory in IPv6)
+	udpCsum := CalculateUDPChecksumIPv6(src16, dst16, pkt[ip6HdrLen:])
+	binary.BigEndian.PutUint16(pkt[46:48], udpCsum)
+
 	return pkt
+}
+
+// CalculateIPv4HeaderChecksum calculates standard Internet checksum over an IPv4 header (bytes 10-11 zeroed/ignored).
+func CalculateIPv4HeaderChecksum(hdr []byte) uint16 {
+	var csum uint32
+	for i := 0; i < len(hdr)-1; i += 2 {
+		if i == 10 {
+			continue // Skip checksum field
+		}
+		csum += uint32(hdr[i])<<8 | uint32(hdr[i+1])
+	}
+	for csum > 0xffff {
+		csum = (csum >> 16) + (csum & 0xffff)
+	}
+	return ^uint16(csum)
+}
+
+// CalculateUDPChecksumIPv4 calculates the RFC 768 UDP checksum over IPv4 pseudo-header + UDP segment.
+func CalculateUDPChecksumIPv4(srcIP, dstIP, udpSegment []byte) uint16 {
+	var csum uint32
+	// IPv4 Pseudo-header: SrcIP (4) + DstIP (4) + zero (1) + proto (1) + udpLen (2)
+	csum += uint32(srcIP[0])<<8 | uint32(srcIP[1])
+	csum += uint32(srcIP[2])<<8 | uint32(srcIP[3])
+	csum += uint32(dstIP[0])<<8 | uint32(dstIP[1])
+	csum += uint32(dstIP[2])<<8 | uint32(dstIP[3])
+	udpLen := uint32(len(udpSegment))
+	csum += udpLen
+	csum += uint32(IPPROTO_UDP) // 17
+
+	// UDP Segment (header + payload)
+	for i := 0; i < len(udpSegment)-1; i += 2 {
+		if i == 6 {
+			continue // Skip checksum field in UDP header
+		}
+		csum += uint32(udpSegment[i])<<8 | uint32(udpSegment[i+1])
+	}
+	if len(udpSegment)%2 != 0 {
+		csum += uint32(udpSegment[len(udpSegment)-1]) << 8
+	}
+
+	for csum > 0xffff {
+		csum = (csum >> 16) + (csum & 0xffff)
+	}
+	result := ^uint16(csum)
+	if result == 0 {
+		result = 0xffff // RFC 768: 0 is transmitted as all ones
+	}
+	return result
+}
+
+// CalculateUDPChecksumIPv6 calculates the RFC 8200 UDP checksum over IPv6 pseudo-header + UDP segment.
+func CalculateUDPChecksumIPv6(srcIP, dstIP, udpSegment []byte) uint16 {
+	var csum uint32
+	// IPv6 Pseudo-header: SrcIP (16) + DstIP (16) + udpLen (4) + nextHdr (4)
+	for i := 0; i < 16; i += 2 {
+		csum += uint32(srcIP[i])<<8 | uint32(srcIP[i+1])
+		csum += uint32(dstIP[i])<<8 | uint32(dstIP[i+1])
+	}
+	udpLen := uint32(len(udpSegment))
+	csum += udpLen >> 16
+	csum += udpLen & 0xffff
+	csum += uint32(IPPROTO_UDP) // 17
+
+	// UDP Segment (header + payload)
+	for i := 0; i < len(udpSegment)-1; i += 2 {
+		if i == 6 {
+			continue // Skip checksum field in UDP header
+		}
+		csum += uint32(udpSegment[i])<<8 | uint32(udpSegment[i+1])
+	}
+	if len(udpSegment)%2 != 0 {
+		csum += uint32(udpSegment[len(udpSegment)-1]) << 8
+	}
+
+	for csum > 0xffff {
+		csum = (csum >> 16) + (csum & 0xffff)
+	}
+	result := ^uint16(csum)
+	if result == 0 {
+		result = 0xffff // RFC 8200: 0 is transmitted as 0xffff
+	}
+	return result
 }
 

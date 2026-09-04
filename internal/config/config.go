@@ -172,7 +172,11 @@ func (m *Manager) StartAutoReload() {
 					}
 				}()
 
-				ticker := time.NewTicker(time.Duration(m.Get().ReloadIntervalSec) * time.Second)
+				currInterval := m.Get().ReloadIntervalSec
+				if currInterval <= 0 {
+					currInterval = 5
+				}
+				ticker := time.NewTicker(time.Duration(currInterval) * time.Second)
 				defer ticker.Stop()
 
 				for {
@@ -182,6 +186,14 @@ func (m *Manager) StartAutoReload() {
 						return
 					case <-ticker.C:
 						m.checkAndReload()
+						newInterval := m.Get().ReloadIntervalSec
+						if newInterval <= 0 {
+							newInterval = 5
+						}
+						if newInterval != currInterval {
+							currInterval = newInterval
+							ticker.Reset(time.Duration(currInterval) * time.Second)
+						}
 					}
 				}
 			}()
