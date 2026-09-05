@@ -51,6 +51,8 @@ type Redirector struct {
 	savedDNSEng    DNSEvaluator
 	coarseNano     atomic.Int64
 	dnsQueue       chan dnsTask
+	filterUDP      bool
+	udpFlowTable   *UDPFlowTable
 	mu             sync.Mutex
 	closed         bool
 }
@@ -102,9 +104,20 @@ func NewRedirector(localListenAddr string, customFilter string) (*Redirector, er
 		localProxyIP:   ip,
 		pid:            pid,
 		dnsQueue:       make(chan dnsTask, 2048),
+		udpFlowTable:   NewUDPFlowTable(60),
 	}
 	r.coarseNano.Store(time.Now().UnixNano())
 	return r, nil
+}
+
+// SetUDPFilter configures general UDP traffic auditing and filtering.
+func (r *Redirector) SetUDPFilter(filterUDP bool, filterEng FilterEvaluator) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.filterUDP = filterUDP
+	if filterEng != nil {
+		r.filterEng = filterEng
+	}
 }
 
 // SetDryRun configures dry-run audit mode without intercepting traffic.
@@ -521,6 +534,39 @@ func (r *Redirector) packetLoop(ctx context.Context, workerID int) {
 								}
 
 								continue // Handled asynchronously
+							} else if r.filterUDP {
+								// General UDP traffic audit and filtering
+								targetIP := net.IPv4(dstIP[0], dstIP[1], dstIP[2], dstIP[3])
+								flowKey := MakeUDPFlowKeyIPv4(srcIP, dstIP, srcPort, dstPort)
+								nowSec := r.coarseNano.Load() / 1e9
+
+								isNewFlow := r.udpFlowTable.CheckAndRecord(flowKey, nowSec)
+
+								shouldBlock := false
+								if r.filterEng != nil {
+									shouldBlock = r.filterEng.ShouldBlock(targetIP.String())
+								}
+
+								if isNewFlow {
+									if shouldBlock {
+										log.Printf("[BLOCK] UDP     | Client: %-21s | Target: %-30s -> Blocked by policy",
+											flowKey.ClientString(), flowKey.TargetString())
+									} else {
+										log.Printf("[ALLOW] UDP     | Client: %-21s | Target: %-30s",
+											flowKey.ClientString(), flowKey.TargetString())
+									}
+								}
+
+								if shouldBlock && !r.dryRun {
+									continue // Drop packet
+								}
+
+								// Allow / Passthrough: re-inject original packet back to network
+								_, sendErr := r.dll.Send(r.handle, rawPacket, &addr)
+								if sendErr != nil {
+									logger.Debugf("[Redirector] UDP IPv4 passthrough send failed: %v", sendErr)
+								}
+								continue
 							}
 						}
 					}
@@ -699,6 +745,39 @@ func (r *Redirector) packetLoop(ctx context.Context, workerID int) {
 								}
 
 								continue // Handled asynchronously
+							} else if r.filterUDP {
+								// IPv6 General UDP traffic audit and filtering
+								targetIP := net.IP(dstIP6[:])
+								flowKey := MakeUDPFlowKeyIPv6(srcIP6, dstIP6, srcPort, dstPort)
+								nowSec := r.coarseNano.Load() / 1e9
+
+								isNewFlow := r.udpFlowTable.CheckAndRecord(flowKey, nowSec)
+
+								shouldBlock := false
+								if r.filterEng != nil {
+									shouldBlock = r.filterEng.ShouldBlock(targetIP.String())
+								}
+
+								if isNewFlow {
+									if shouldBlock {
+										log.Printf("[BLOCK] UDP     | Client: %-21s | Target: %-30s -> Blocked by policy",
+											flowKey.ClientString(), flowKey.TargetString())
+									} else {
+										log.Printf("[ALLOW] UDP     | Client: %-21s | Target: %-30s",
+											flowKey.ClientString(), flowKey.TargetString())
+									}
+								}
+
+								if shouldBlock && !r.dryRun {
+									continue // Drop packet
+								}
+
+								// Allow / Passthrough: re-inject original packet back to network
+								_, sendErr := r.dll.Send(r.handle, rawPacket, &addr)
+								if sendErr != nil {
+									logger.Debugf("[Redirector] UDP IPv6 passthrough send failed: %v", sendErr)
+								}
+								continue
 							}
 						}
 					}
@@ -763,6 +842,9 @@ func (r *Redirector) sessionGCLoop(ctx context.Context) {
 							}
 							return true
 						})
+					}
+					if r.udpFlowTable != nil {
+						r.udpFlowTable.Cleanup(now.Unix())
 					}
 				}
 			}

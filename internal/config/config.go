@@ -39,6 +39,7 @@ type Config struct {
 	DNSCacheEnabled   bool     `json:"dns_cache_enabled"`   // If true, enable in-memory caching of DNS answers (default: true)
 	DNSCacheTTLSec    int      `json:"dns_cache_ttl_sec"`   // Max TTL in seconds for DNS answer cache (default: 300)
 	DNSServers        []string `json:"dns_servers"`         // Custom upstream DNS servers (e.g. ["169.254.169.254"]). If empty, defaults to Cloudflare Security DoH (1.1.1.2)
+	FilterUDP         bool     `json:"filter_udp"`          // If true, audit and control general UDP traffic (default: false)
 }
 
 // Default DNS server lists (Cloudflare Security DNS: Malware & Phishing Blocking)
@@ -66,15 +67,21 @@ func (c *Config) GetEffectiveDNSServers() []string {
 // BuildDivertFilter generates a complete WinDivert filter string capturing ALL TCP outbound traffic,
 // excluding loopback, local proxy port, and proxy outbound port range (40000-48999) to prevent self-interception loops.
 // When DohEnabled is true and no custom DNS is configured, it also captures outbound UDP port 53 traffic.
+// When FilterUDP is true, it also captures outbound UDP traffic (excluding ports 53 and 443 which have dedicated handlers).
 func (c *Config) BuildDivertFilter(localProxyPort uint16) (forwardCond string, fullFilter string) {
 	dohFilter := ""
 	if c.DohEnabled && !c.IsCustomDNS() {
 		dohFilter = " or (outbound and udp and udp.DstPort == 53 and !loopback)"
 	}
 
+	udpFilter := ""
+	if c.FilterUDP {
+		udpFilter = " or (outbound and udp and udp.DstPort != 53 and udp.DstPort != 443 and !loopback)"
+	}
+
 	if c.DivertFilter != "" {
-		return c.DivertFilter, fmt.Sprintf("((%s) or (outbound and tcp and tcp.SrcPort == %d) or (outbound and udp and udp.DstPort == 443 and !loopback)%s)",
-			c.DivertFilter, localProxyPort, dohFilter)
+		return c.DivertFilter, fmt.Sprintf("((%s) or (outbound and tcp and tcp.SrcPort == %d) or (outbound and udp and udp.DstPort == 443 and !loopback)%s%s)",
+			c.DivertFilter, localProxyPort, dohFilter, udpFilter)
 	}
 
 	// Capture all outbound TCP traffic on all ports (1-65535) except:
@@ -84,8 +91,8 @@ func (c *Config) BuildDivertFilter(localProxyPort uint16) (forwardCond string, f
 	forwardCond = fmt.Sprintf("outbound and tcp and !loopback and tcp.DstPort != %d and (tcp.SrcPort < %d or tcp.SrcPort > %d)",
 		localProxyPort, OutboundPortMin, OutboundPortMax)
 
-	fullFilter = fmt.Sprintf("((%s) or (outbound and tcp and tcp.SrcPort == %d) or (outbound and udp and udp.DstPort == 443 and !loopback)%s)",
-		forwardCond, localProxyPort, dohFilter)
+	fullFilter = fmt.Sprintf("((%s) or (outbound and tcp and tcp.SrcPort == %d) or (outbound and udp and udp.DstPort == 443 and !loopback)%s%s)",
+		forwardCond, localProxyPort, dohFilter, udpFilter)
 	return forwardCond, fullFilter
 }
 
@@ -112,6 +119,7 @@ func DefaultConfig() *Config {
 		FallbackToUDP:     true,
 		DNSCacheEnabled:   true,
 		DNSCacheTTLSec:    300,
+		FilterUDP:         false,
 	}
 }
 

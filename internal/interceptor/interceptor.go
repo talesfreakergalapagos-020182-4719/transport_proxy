@@ -114,6 +114,7 @@ type Interceptor interface {
 	SetDryRun(dryRun bool, forwardCond string, filterEng FilterEvaluator, routingEng RoutingEvaluator)
 	SetDNSEngine(dnsEng DNSEvaluator)
 	SetDNSServers(dnsServers []string)
+	SetUDPFilter(filterUDP bool, filterEng FilterEvaluator)
 }
 
 // ConflictingPortInfo stores details about a non-tproxy process using a given port or port range.

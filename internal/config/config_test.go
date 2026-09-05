@@ -389,6 +389,19 @@ func TestConfig_BuildDivertFilter_EdgeCases(t *testing.T) {
 	if strings.Contains(filterWithDNS, "udp.DstPort == 53") {
 		t.Errorf("Expected custom DNS config to NOT capture DNS in WinDivert filter, got: %s", filterWithDNS)
 	}
+
+	// 4. FilterUDP false (default): General UDP capture must NOT be present
+	if strings.Contains(filterDefault, "udp.DstPort != 53 and udp.DstPort != 443") {
+		t.Errorf("Expected default filter to NOT capture general UDP, got: %s", filterDefault)
+	}
+
+	// 5. FilterUDP true: General UDP capture must be included
+	cfgWithUDP := DefaultConfig()
+	cfgWithUDP.FilterUDP = true
+	_, filterWithUDP := cfgWithUDP.BuildDivertFilter(18080)
+	if !strings.Contains(filterWithUDP, "udp.DstPort != 53 and udp.DstPort != 443") {
+		t.Errorf("Expected FilterUDP true to include general UDP capture, got: %s", filterWithUDP)
+	}
 }
 
 

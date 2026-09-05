@@ -15,6 +15,7 @@
   "connect_timeout_sec": 10,
   "idle_timeout_sec": 60,
   "reload_interval_sec": 5,
+  "filter_udp": false,
   "divert_filter": "",
   "allowed_domains": [
     "*.windowsupdate.com",

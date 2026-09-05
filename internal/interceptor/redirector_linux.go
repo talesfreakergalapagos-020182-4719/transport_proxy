@@ -40,6 +40,7 @@ type Redirector struct {
 	dnsUDPConn2     *net.UDPConn
 	uid             int
 	rulesApplied    bool
+	filterUDP       bool
 	mu              sync.Mutex
 	closed          bool
 }
@@ -96,6 +97,16 @@ func (r *Redirector) SetDNSServers(dnsServers []string) {
 		} else {
 			log.Printf("[Redirector] Successfully updated iptables rules for DNS servers: %v", dnsServers)
 		}
+	}
+}
+
+// SetUDPFilter configures general UDP traffic auditing and filtering.
+func (r *Redirector) SetUDPFilter(filterUDP bool, filterEng FilterEvaluator) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.filterUDP = filterUDP
+	if filterEng != nil {
+		r.filterEng = filterEng
 	}
 }
 

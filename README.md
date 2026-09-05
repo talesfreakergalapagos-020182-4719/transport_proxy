@@ -283,6 +283,7 @@ export all_proxy=http://127.0.0.1:18080
 | `idle_timeout_sec` | `int` | `60` | ✅ 対応 | 無通信接続の切断秒数。`0` で無期限維持（RDP・SSH に推奨） |
 | `reload_interval_sec` | `int` | `5` | ✅ 対応 | 設定ファイルのホットリロード変更検知周期（秒。変更時は即座に再設定） |
 | `log_file` | `string` | `""` | ✅ 対応 | ログ出力先ファイルパス（変更時は新しいファイルへ自動切り替え） |
+| `filter_udp` | `bool` | `false` | ✅ 対応 | 一般 UDP 通信（DNS 53/QUIC 443以外）の監査・制御。`filter_mode: "all"` 時は制限せず `[ALLOW] UDP` ログ出力＆パススルー |
 | `dry_run` | `bool` | `false` | ❌ 要再起動 | `true` で通信を遮断・変更せず監査ログ出力のみ行うモード |
 | `divert_filter` | `string` | `""` | ❌ 要再起動 | WinDivert のカスタムキャプチャ条件（通常は空文字推奨） |
 
@@ -329,6 +330,9 @@ Windows 版は **WinDivert**（WFP: Windows Filtering Platform カーネルド�
          |                      v
          |                    WinDivert で応答パケットをカーネルへ直接インジェクト
          |
+         +-- UDP (その他) ----> filter_udp=true 時: フロー重複排除 + 監査ログ出力
+         |                      (filter_mode: "all" 時は制限せず無遅延パススルー)
+         |
          +-- TCP (その他)  --> パケットをローカルプロキシへリダイレクト
                                 |
                                 v
@@ -348,6 +352,11 @@ Windows 版は **WinDivert**（WFP: Windows Filtering Platform カーネルド�
 
 #### HTTP/3 (QUIC) 自動フォールバック機構
 Chrome や Edge などのモダンブラウザは、デフォルトで HTTP/3（QUIC: UDP 443）通信を優先して試行します。UDP 443 が通過すると TLS SNI 検査やプロキシ中継をすり抜けてしまうため、WinDivert レイヤーで UDP 443 パケットを自動的にドロップ（破棄）します。これにより、ブラウザは標準仕様に則って即座に TCP（HTTP/1.1・HTTP/2 / TLS）へ安全にフォールバックし、本ソフトによる確実なポリシー制御・プロキシ中継が行われます。
+
+#### 一般 UDP 通信の監査・パススルー（`filter_udp`）
+`filter_udp: true` を設定すると、DNS (53) や QUIC (443) 以外の一般的な UDP 通信（NTP、WebRTC、各種業務アプリ等）も監査・制御の対象に含めることができます。  
+* **フロー重複排除（UDP Flow Table）**: UDP は 1 秒間に数百パケット流れるため、通信ペア（送信元 ↔ 宛先）をメモリ上で軽量追跡し、セッション開始時にのみ監査ログ（`[ALLOW] UDP` または `[BLOCK] UDP`）を出力します。
+* **`filter_mode: "all"` での無制限パススルー**: `filter_mode` が `"all"` の場合、通信を一切ブロックせず `[ALLOW] UDP` ログを記録した上で、そのままネットワークへ再インジェクト（通過）させます。業務通信に遅延や影響を与えることなく、全 UDP 通信の可視化が可能です。
 
 #### Windows 独自のポート保護機構（PortGuard）
 Windows 版では、プロキシ自身が発する上流へのアウトバウンド接続が WinDivert に再キャプチャされて無限ループに陥るのを防ぐため、送信元ポート範囲（`40000-48999`）を予約しています。  

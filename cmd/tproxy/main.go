@@ -223,6 +223,10 @@ func main() {
 	}
 	redirector.SetDryRun(isDryRun, forwardCond, filterEng, pacResolver)
 	redirector.SetDNSServers(cfg.DNSServers)
+	redirector.SetUDPFilter(cfg.FilterUDP, filterEng)
+	if cfg.FilterUDP {
+		log.Printf("[UDP]    General UDP Traffic Audit & Filtering: ENABLED (FilterMode=%s)", filterMode)
+	}
 
 	// 5. Initialize DNS-to-DoH Engine
 	dnsEng := dns.NewEngine(cfgMgr, filterEng, pacResolver)
@@ -256,17 +260,18 @@ func main() {
 		dnsEng.UpdateConfig(newCfg)
 		redirector.SetDNSServers(newCfg.DNSServers)
 		redirector.SetDryRun(newCfg.DryRun, forwardCond, filterEng, pacResolver)
+		redirector.SetUDPFilter(newCfg.FilterUDP, filterEng)
 
 		if cliLogFile == "" && newCfg.LogFile != currentLogPath {
 			setLoggerOutput(newCfg.LogFile)
 		}
 
 		if isAllPassReload {
-			log.Printf("[Config] Reloaded: ALL-PASS mode (filtering disabled). PAC=%s, Upstream=%s, DNS=%v, DryRun=%v",
-				newCfg.PacURL, newCfg.UpstreamProxy, newCfg.DNSServers, newCfg.DryRun)
+			log.Printf("[Config] Reloaded: ALL-PASS mode (filtering disabled). PAC=%s, Upstream=%s, DNS=%v, FilterUDP=%v, DryRun=%v",
+				newCfg.PacURL, newCfg.UpstreamProxy, newCfg.DNSServers, newCfg.FilterUDP, newCfg.DryRun)
 		} else {
-			log.Printf("[Config] Reloaded (%s mode): %d domains, %d IPs. PAC=%s, Upstream=%s, DNS=%v, DryRun=%v",
-				mode, len(d), len(ips), newCfg.PacURL, newCfg.UpstreamProxy, newCfg.DNSServers, newCfg.DryRun)
+			log.Printf("[Config] Reloaded (%s mode): %d domains, %d IPs. PAC=%s, Upstream=%s, DNS=%v, FilterUDP=%v, DryRun=%v",
+				mode, len(d), len(ips), newCfg.PacURL, newCfg.UpstreamProxy, newCfg.DNSServers, newCfg.FilterUDP, newCfg.DryRun)
 		}
 	})
 	cfgMgr.StartAutoReload()
