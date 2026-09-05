@@ -4,11 +4,14 @@ import (
 	"bufio"
 	"crypto/tls"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -85,35 +88,39 @@ func (f *Forwarder) SetTLSConfig(cfg *tls.Config) {
 	f.tlsConfig = cfg
 }
 
-// DialOutbound connects to the target address either directly (if proxyURL is empty)
-// or tunnels through the specified proxyURL with optional SSPI authentication.
-func (f *Forwarder) DialOutbound(targetAddr string, proxyURLStr string) (net.Conn, io.Reader, error) {
-	if proxyURLStr == "" {
-		// Direct outbound connection using reserved outbound port range
-		conn, err := f.dialTCP("tcp", targetAddr)
-		if err != nil {
-			return nil, nil, fmt.Errorf("direct dial to %s failed: %w", targetAddr, err)
-		}
-		return conn, nil, nil
+// SanitizeProxyURL normalizes proxy URLs, escaping unescaped backslashes in userinfo
+// so that Windows domain credentials like "http://CORP\username:password@proxy:8080"
+// parse cleanly with net/url.
+func SanitizeProxyURL(rawURL string) string {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return ""
 	}
 
-	proxyURL, err := url.Parse(proxyURLStr)
-	if err != nil {
-		return nil, nil, fmt.Errorf("invalid proxy URL %q: %w", proxyURLStr, err)
+	schemeEnd := strings.Index(rawURL, "://")
+	if schemeEnd == -1 {
+		return rawURL
 	}
 
-	proxyHostPort := proxyURL.Host
-	if proxyURL.Port() == "" {
-		if proxyURL.Scheme == "https" {
-			proxyHostPort = net.JoinHostPort(proxyURL.Hostname(), "443")
-		} else {
-			proxyHostPort = net.JoinHostPort(proxyURL.Hostname(), "8080")
-		}
+	lastAt := strings.LastIndex(rawURL, "@")
+	if lastAt == -1 || lastAt < schemeEnd+3 {
+		return rawURL
 	}
 
+	// Between schemeEnd+3 and lastAt is userinfo
+	userInfo := rawURL[schemeEnd+3 : lastAt]
+	if strings.Contains(userInfo, `\`) {
+		sanitizedUserInfo := strings.ReplaceAll(userInfo, `\`, "%5C")
+		return rawURL[:schemeEnd+3] + sanitizedUserInfo + rawURL[lastAt:]
+	}
+
+	return rawURL
+}
+
+func (f *Forwarder) dialProxyConn(proxyURL *url.URL, proxyHostPort string) (net.Conn, error) {
 	proxyConn, err := f.dialTCP("tcp", proxyHostPort)
 	if err != nil {
-		return nil, nil, fmt.Errorf("connecting to proxy %s failed: %w", proxyHostPort, err)
+		return nil, fmt.Errorf("connecting to proxy %s failed: %w", proxyHostPort, err)
 	}
 
 	if proxyURL.Scheme == "https" {
@@ -129,9 +136,43 @@ func (f *Forwarder) DialOutbound(targetAddr string, proxyURLStr string) (net.Con
 		tlsConn := tls.Client(proxyConn, tlsCfg)
 		if err := tlsConn.Handshake(); err != nil {
 			_ = proxyConn.Close()
-			return nil, nil, fmt.Errorf("TLS handshake to upstream proxy %s failed: %w", proxyHostPort, err)
+			return nil, fmt.Errorf("TLS handshake to upstream proxy %s failed: %w", proxyHostPort, err)
 		}
 		proxyConn = tlsConn
+	}
+	return proxyConn, nil
+}
+
+// DialOutbound connects to the target address either directly (if proxyURL is empty)
+// or tunnels through the specified proxyURL with optional SSPI authentication.
+func (f *Forwarder) DialOutbound(targetAddr string, proxyURLStr string) (net.Conn, io.Reader, error) {
+	if proxyURLStr == "" {
+		// Direct outbound connection using reserved outbound port range
+		conn, err := f.dialTCP("tcp", targetAddr)
+		if err != nil {
+			return nil, nil, fmt.Errorf("direct dial to %s failed: %w", targetAddr, err)
+		}
+		return conn, nil, nil
+	}
+
+	sanitizedURL := SanitizeProxyURL(proxyURLStr)
+	proxyURL, err := url.Parse(sanitizedURL)
+	if err != nil {
+		return nil, nil, fmt.Errorf("invalid proxy URL %q: %w", proxyURLStr, err)
+	}
+
+	proxyHostPort := proxyURL.Host
+	if proxyURL.Port() == "" {
+		if proxyURL.Scheme == "https" {
+			proxyHostPort = net.JoinHostPort(proxyURL.Hostname(), "443")
+		} else {
+			proxyHostPort = net.JoinHostPort(proxyURL.Hostname(), "8080")
+		}
+	}
+
+	proxyConn, err := f.dialProxyConn(proxyURL, proxyHostPort)
+	if err != nil {
+		return nil, nil, err
 	}
 
 	if f.bypassSSPI {
@@ -156,10 +197,16 @@ func (f *Forwarder) DialOutbound(targetAddr string, proxyURLStr string) (net.Con
 			_ = proxyConn.Close()
 			return nil, nil, fmt.Errorf("failed to read proxy response: %w", err)
 		}
+		if resp.StatusCode != http.StatusOK && resp.ContentLength > 0 {
+			_, _ = io.CopyN(io.Discard, resp.Body, resp.ContentLength)
+		}
 		_ = resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
 			_ = proxyConn.Close()
+			if strings.Contains(targetAddr, ":80") && resp.StatusCode == http.StatusForbidden {
+				log.Printf("[WARNING] Upstream proxy rejected CONNECT to port 80 (%s) with 403 Forbidden. Many corporate proxies restrict CONNECT to SSL ports (443).", targetAddr)
+			}
 			return nil, nil, fmt.Errorf("proxy returned non-200 response: %s", resp.Status)
 		}
 
@@ -170,6 +217,47 @@ func (f *Forwarder) DialOutbound(targetAddr string, proxyURLStr string) (net.Con
 	reader, err := sspi.AuthenticateProxyTunnel(proxyConn, targetAddr, proxyURL, f.connectTimeout)
 	if err != nil {
 		_ = proxyConn.Close()
+
+		// If SSPI failed but Basic credentials are available, retry with a fresh connection and Basic auth
+		if errors.Is(err, sspi.ErrSSPIFailedWithBasicAvailable) && proxyURL.User != nil {
+			logger.Debugf("[ProxyForwarder] Retrying with fresh connection and Basic authentication for %s...", targetAddr)
+			freshConn, dialErr := f.dialProxyConn(proxyURL, proxyHostPort)
+			if dialErr != nil {
+				return nil, nil, fmt.Errorf("re-dialing proxy %s for Basic auth fallback failed: %w", proxyHostPort, dialErr)
+			}
+
+			username := proxyURL.User.Username()
+			password, _ := proxyURL.User.Password()
+			token := base64.StdEncoding.EncodeToString([]byte(username + ":" + password))
+			connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\nProxy-Connection: Keep-Alive\r\nProxy-Authorization: Basic %s\r\n\r\n",
+				targetAddr, targetAddr, token)
+			if _, wErr := freshConn.Write([]byte(connectReq)); wErr != nil {
+				_ = freshConn.Close()
+				return nil, nil, fmt.Errorf("failed to send Basic CONNECT request: %w", wErr)
+			}
+
+			freshReader := bufio.NewReader(freshConn)
+			resp, rErr := http.ReadResponse(freshReader, &http.Request{Method: "CONNECT"})
+			if rErr != nil {
+				_ = freshConn.Close()
+				return nil, nil, fmt.Errorf("failed to read response on Basic retry: %w", rErr)
+			}
+			if resp.StatusCode != http.StatusOK && resp.ContentLength > 0 {
+				_, _ = io.CopyN(io.Discard, resp.Body, resp.ContentLength)
+			}
+			_ = resp.Body.Close()
+
+			if resp.StatusCode == http.StatusOK {
+				logger.Debugf("[ProxyForwarder] Basic fallback connection established for %s", targetAddr)
+				return freshConn, freshReader, nil
+			}
+			_ = freshConn.Close()
+			return nil, nil, fmt.Errorf("proxy returned status %d after Basic fallback: %s", resp.StatusCode, resp.Status)
+		}
+
+		if strings.Contains(targetAddr, ":80") && strings.Contains(err.Error(), "403") {
+			log.Printf("[WARNING] Upstream proxy rejected CONNECT to port 80 (%s). Many corporate proxies disallow CONNECT on non-SSL ports. Check proxy configuration if HTTP traffic fails.", targetAddr)
+		}
 		return nil, nil, fmt.Errorf("proxy tunnel authentication failed for %s: %w", proxyHostPort, err)
 	}
 
@@ -308,6 +396,13 @@ func PipeConnEx(c1 net.Conn, c2 net.Conn, clientPreBuffered io.Reader, upstreamP
 					closeWrite(c1)
 				} else if er == io.EOF {
 					closeWrite(c1)
+					drainTimeout := idleTimeout
+					if isPermanent || drainTimeout > 60*time.Second {
+						drainTimeout = 60 * time.Second
+					}
+					if drainTimeout > 0 {
+						_ = c1.SetReadDeadline(time.Now().Add(drainTimeout))
+					}
 				} else {
 					_ = c1.Close()
 					_ = c2.Close()
@@ -397,6 +492,13 @@ func PipeConnEx(c1 net.Conn, c2 net.Conn, clientPreBuffered io.Reader, upstreamP
 					closeWrite(c2)
 				} else if er == io.EOF {
 					closeWrite(c2)
+					drainTimeout := idleTimeout
+					if isPermanent || drainTimeout > 60*time.Second {
+						drainTimeout = 60 * time.Second
+					}
+					if drainTimeout > 0 {
+						_ = c2.SetReadDeadline(time.Now().Add(drainTimeout))
+					}
 				} else {
 					_ = c1.Close()
 					_ = c2.Close()

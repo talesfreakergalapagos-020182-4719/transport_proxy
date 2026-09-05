@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net"
 	"net/url"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -84,10 +83,10 @@ func (e *JSEngine) FindProxyForURL(targetURL string, host string) (string, error
 	if vm == nil {
 		return "", fmt.Errorf("failed to obtain VM instance from pool")
 	}
-	defer e.releaseVM(vm)
 
 	fn, ok := goja.AssertFunction(vm.Get("FindProxyForURL"))
 	if !ok {
+		e.releaseVM(vm)
 		return "", fmt.Errorf("FindProxyForURL not found in VM")
 	}
 
@@ -110,8 +109,11 @@ func (e *JSEngine) FindProxyForURL(targetURL string, host string) (string, error
 	case <-ctx.Done():
 		vm.Interrupt("PAC execution timeout")
 		<-done
+		// Do NOT return interrupted VM to pool to avoid corrupting future executions
 		return "", fmt.Errorf("PAC execution timed out after %v", e.timeout)
 	case <-done:
+		// Normal completion: return healthy VM back to pool
+		e.releaseVM(vm)
 		if err != nil {
 			return "", fmt.Errorf("FindProxyForURL error: %w", err)
 		}
@@ -231,19 +233,7 @@ func (e *JSEngine) bindStandardPACFunctions(vm *goja.Runtime) {
 
 	// shExpMatch(str, pattern) - Shell wildcard matching (* and ?)
 	_ = vm.Set("shExpMatch", func(str, pattern string) bool {
-		// Convert standard PAC shell wildcards to filepath.Match compatible
-		matched, err := filepath.Match(strings.ToLower(pattern), strings.ToLower(str))
-		if err == nil && matched {
-			return true
-		}
-		// Also handle simple sub-domain wildcards like *.example.com matching example.com
-		if strings.HasPrefix(pattern, "*.") {
-			trimmedPattern := pattern[2:]
-			if strings.EqualFold(str, trimmedPattern) {
-				return true
-			}
-		}
-		return false
+		return MatchShExp(str, pattern)
 	})
 
 	// alert(msg) - Debug print
@@ -307,4 +297,45 @@ func ParsePACResult(pacResult string) ProxyDecision {
 	}
 
 	return ProxyDecision{IsDirect: true}
+}
+
+// MatchShExp implements shell expression matching (* and ?) compatible with PAC shExpMatch.
+// Unlike filepath.Match, it does not treat '/' as a separator, allowing full URL matching.
+func MatchShExp(str, pattern string) bool {
+	return wildcardMatch(str, pattern)
+}
+
+func wildcardMatch(s, p string) bool {
+	sRunes := []rune(s)
+	pRunes := []rune(p)
+	sLen := len(sRunes)
+	pLen := len(pRunes)
+
+	sIdx := 0
+	pIdx := 0
+	matchIdx := 0
+	starIdx := -1
+
+	for sIdx < sLen {
+		if pIdx < pLen && (pRunes[pIdx] == '?' || pRunes[pIdx] == sRunes[sIdx]) {
+			sIdx++
+			pIdx++
+		} else if pIdx < pLen && pRunes[pIdx] == '*' {
+			starIdx = pIdx
+			matchIdx = sIdx
+			pIdx++
+		} else if starIdx != -1 {
+			pIdx = starIdx + 1
+			matchIdx++
+			sIdx = matchIdx
+		} else {
+			return false
+		}
+	}
+
+	for pIdx < pLen && pRunes[pIdx] == '*' {
+		pIdx++
+	}
+
+	return pIdx == pLen
 }

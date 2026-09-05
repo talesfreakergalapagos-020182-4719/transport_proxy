@@ -319,3 +319,234 @@ func TestAuthenticateProxyTunnel_SpecialCharactersInCredentials(t *testing.T) {
 	}
 }
 
+func TestExtractChallengeToken_EdgeCases(t *testing.T) {
+	testCases := []struct {
+		name           string
+		headerValues   []string
+		selectedScheme string
+		expectScheme   string
+		expectToken    string
+		expectFound    bool
+	}{
+		{
+			name:           "Comma-combined NTLM and Basic",
+			headerValues:   []string{"NTLM TlRMTVNTUAACAAAA...==, Basic realm=\"corp\""},
+			selectedScheme: "NTLM",
+			expectScheme:   "NTLM",
+			expectToken:    "TlRMTVNTUAACAAAA...==",
+			expectFound:    true,
+		},
+		{
+			name:           "Comma in quoted realm before NTLM",
+			headerValues:   []string{"Basic realm=\"corp, inc\", NTLM TlRMTVNTUAACAAAA...=="},
+			selectedScheme: "NTLM",
+			expectScheme:   "NTLM",
+			expectToken:    "TlRMTVNTUAACAAAA...==",
+			expectFound:    true,
+		},
+		{
+			name:           "Negotiate request with NTLM challenge fallback",
+			headerValues:   []string{"NTLM TlRMTVNTUAACAAAA...=="},
+			selectedScheme: "Negotiate",
+			expectScheme:   "NTLM",
+			expectToken:    "TlRMTVNTUAACAAAA...==",
+			expectFound:    true,
+		},
+		{
+			name:           "Negotiate with trailing comma and whitespace",
+			headerValues:   []string{"Negotiate oYG2MIGzoAMKAQChCwYJKoZIgvcSAQIC..., "},
+			selectedScheme: "Negotiate",
+			expectScheme:   "Negotiate",
+			expectToken:    "oYG2MIGzoAMKAQChCwYJKoZIgvcSAQIC...",
+			expectFound:    true,
+		},
+		{
+			name:           "No matching scheme",
+			headerValues:   []string{"Digest realm=\"corp\""},
+			selectedScheme: "NTLM",
+			expectScheme:   "",
+			expectToken:    "",
+			expectFound:    false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := &http.Response{
+				Header: make(http.Header),
+			}
+			for _, v := range tc.headerValues {
+				resp.Header.Add("Proxy-Authenticate", v)
+			}
+
+			scheme, token, found := ExtractChallengeToken(resp, tc.selectedScheme)
+			if found != tc.expectFound {
+				t.Fatalf("Expected found=%v, got %v", tc.expectFound, found)
+			}
+			if tc.expectFound {
+				if !strings.EqualFold(scheme, tc.expectScheme) {
+					t.Errorf("Expected scheme %q, got %q", tc.expectScheme, scheme)
+				}
+				if token != tc.expectToken {
+					t.Errorf("Expected token %q, got %q", tc.expectToken, token)
+				}
+			}
+		})
+	}
+}
+
+func TestAuthenticateProxyTunnel_PreemptiveBasicAuthWhenCredentialsProvided(t *testing.T) {
+	// Verify that if credentials are provided in proxy URL, preemptive Basic auth is sent
+	// even if on Windows, avoiding 407 disconnects.
+	expectedUser := "testuser"
+	expectedPass := "testpass"
+	expectedToken := base64.StdEncoding.EncodeToString([]byte(expectedUser + ":" + expectedPass))
+
+	reqReceivedAuth := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodConnect {
+			authHeader := r.Header.Get("Proxy-Authorization")
+			if authHeader == "Basic "+expectedToken {
+				reqReceivedAuth = true
+				hijacker, ok := w.(http.Hijacker)
+				if !ok {
+					http.Error(w, "hijack not supported", 500)
+					return
+				}
+				c, _, _ := hijacker.Hijack()
+				defer c.Close()
+				c.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+				return
+			}
+			// If no preemptive auth was sent, fail the test
+			w.Header().Set("Proxy-Authenticate", "Basic realm=\"Secure\"")
+			w.WriteHeader(http.StatusProxyAuthRequired)
+			return
+		}
+	}))
+	defer server.Close()
+
+	conn, err := net.Dial("tcp", strings.TrimPrefix(server.URL, "http://"))
+	if err != nil {
+		t.Fatalf("Failed to dial: %v", err)
+	}
+	defer conn.Close()
+
+	proxyURL := &url.URL{
+		Scheme: "http",
+		Host:   strings.TrimPrefix(server.URL, "http://"),
+		User:   url.UserPassword(expectedUser, expectedPass),
+	}
+
+	reader, err := AuthenticateProxyTunnel(conn, "target.domain:443", proxyURL, 2*time.Second)
+	if err != nil {
+		t.Fatalf("AuthenticateProxyTunnel failed: %v", err)
+	}
+	if reader == nil {
+		t.Fatalf("Expected non-nil reader")
+	}
+	if !reqReceivedAuth {
+		t.Errorf("Expected preemptive Basic auth header to be received on first request")
+	}
+}
+
+func TestExtractChallengeToken_CombinedComplex(t *testing.T) {
+	testCases := []struct {
+		name         string
+		headerValues []string
+		targetScheme string
+		expectFound  bool
+		expectToken  string
+	}{
+		{
+			name:         "Multiple comma schemes with empty tokens (no challenge present)",
+			headerValues: []string{"Negotiate, NTLM, Basic realm=\"corp\""},
+			targetScheme: "NTLM",
+			expectFound:  false,
+			expectToken:  "",
+		},
+		{
+			name:         "Comma separated schemes where target has base64 token",
+			headerValues: []string{"Negotiate, NTLM TlRMTVNTUAACAAAADAAMADgAAAA=, Basic"},
+			targetScheme: "NTLM",
+			expectFound:  true,
+			expectToken:  "TlRMTVNTUAACAAAADAAMADgAAAA=",
+		},
+		{
+			name:         "Negotiate token followed by comma NTLM",
+			headerValues: []string{"Negotiate oYG2MIGzoAMKAQChCwYJKoZIgvcSAQIC..., NTLM"},
+			targetScheme: "Negotiate",
+			expectFound:  true,
+			expectToken:  "oYG2MIGzoAMKAQChCwYJKoZIgvcSAQIC...",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := &http.Response{Header: make(http.Header)}
+			for _, v := range tc.headerValues {
+				resp.Header.Add("Proxy-Authenticate", v)
+			}
+			_, token, found := ExtractChallengeToken(resp, tc.targetScheme)
+			if found != tc.expectFound {
+				t.Fatalf("Expected found=%v, got %v", tc.expectFound, found)
+			}
+			if token != tc.expectToken {
+				t.Errorf("Expected token %q, got %q", tc.expectToken, token)
+			}
+		})
+	}
+}
+
+func TestAuthenticateProxyTunnel_IPAddressNTLMSelection(t *testing.T) {
+	// Upstream proxy offered both Negotiate and NTLM at an IP address
+	var receivedScheme string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodConnect {
+			authHeader := r.Header.Get("Proxy-Authorization")
+			if authHeader == "" {
+				w.Header().Add("Proxy-Authenticate", "Negotiate")
+				w.Header().Add("Proxy-Authenticate", "NTLM")
+				w.WriteHeader(http.StatusProxyAuthRequired)
+				return
+			}
+			parts := strings.Fields(authHeader)
+			if len(parts) > 0 {
+				receivedScheme = parts[0]
+			}
+			// Respond 200 OK after receiving client auth attempt
+			hijacker, ok := w.(http.Hijacker)
+			if ok {
+				c, _, _ := hijacker.Hijack()
+				defer c.Close()
+				c.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+				return
+			}
+			w.WriteHeader(200)
+			return
+		}
+	}))
+	defer server.Close()
+
+	conn, err := net.Dial("tcp", strings.TrimPrefix(server.URL, "http://"))
+	if err != nil {
+		t.Fatalf("Failed to dial test server: %v", err)
+	}
+	defer conn.Close()
+
+	// URL has IP address (127.0.0.1) as host
+	ipProxyURL, _ := url.Parse(server.URL)
+	reader, err := AuthenticateProxyTunnel(conn, "target.domain:443", ipProxyURL, 2*time.Second)
+	if err != nil {
+		t.Fatalf("AuthenticateProxyTunnel failed for IP proxy: %v", err)
+	}
+	if reader == nil {
+		t.Fatalf("Expected non-nil reader")
+	}
+	// On Windows, when target host is IP address, NTLM must be preferred over Negotiate
+	if receivedScheme != "NTLM" {
+		t.Errorf("Expected IP address proxy to use NTLM auth, got %q", receivedScheme)
+	}
+}
+
+

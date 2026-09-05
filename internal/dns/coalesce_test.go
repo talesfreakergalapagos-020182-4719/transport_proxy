@@ -102,13 +102,15 @@ func TestCoalesceGroup_PanicSafety(t *testing.T) {
 		})
 	}()
 
-	// 2. Secondary concurrent caller must not deadlock
+	// 2. Secondary concurrent caller must not deadlock and must receive an error rather than empty data
 	wg.Add(1)
 	var secondaryDone bool
+	var secondaryErr error
+	var secondaryRes []byte
 	go func() {
 		defer wg.Done()
 		time.Sleep(2 * time.Millisecond) // Ensure primary has registered call
-		_, _, _ = g.Do(dstIP, qname, qtype, func() ([]byte, error) {
+		secondaryRes, _, secondaryErr = g.Do(dstIP, qname, qtype, func() ([]byte, error) {
 			return []byte("fallback"), nil
 		})
 		secondaryDone = true
@@ -126,6 +128,9 @@ func TestCoalesceGroup_PanicSafety(t *testing.T) {
 		if !secondaryDone {
 			t.Errorf("Expected secondary caller to complete without deadlock")
 		}
+		if secondaryErr == nil {
+			t.Errorf("Expected secondary caller to receive error when primary panicked, got nil error with res=%v", secondaryRes)
+		}
 	case <-time.After(1 * time.Second):
 		t.Fatalf("Deadlock detected! WaitGroup did not complete after panic")
 	}
@@ -138,4 +143,72 @@ func TestCoalesceGroup_PanicSafety(t *testing.T) {
 		t.Errorf("Subsequent call failed: res=%s, shared=%v, err=%v", string(res), shared, err)
 	}
 }
+
+func TestCoalesceGroup_MultipleWaitersPanicRecovery(t *testing.T) {
+	g := NewCoalesceGroup()
+	dstIP := net.ParseIP("8.8.8.8")
+	qname := "burst-panic.test"
+	qtype := TypeA
+
+	const totalWaiters = 10
+	var wg sync.WaitGroup
+	wg.Add(totalWaiters)
+
+	errs := make([]error, totalWaiters)
+	results := make([][]byte, totalWaiters)
+
+	// Primary caller panics after a brief delay
+	go func() {
+		defer wg.Done()
+		defer func() {
+			_ = recover()
+		}()
+		_, _, _ = g.Do(dstIP, qname, qtype, func() ([]byte, error) {
+			time.Sleep(15 * time.Millisecond)
+			panic("catastrophic doh error")
+		})
+	}()
+
+	// Secondary concurrent callers (9 callers)
+	for i := 1; i < totalWaiters; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			time.Sleep(2 * time.Millisecond) // Ensure primary has registered call
+			res, _, err := g.Do(dstIP, qname, qtype, func() ([]byte, error) {
+				return []byte("fallback"), nil
+			})
+			errs[idx] = err
+			results[idx] = res
+		}(i)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		for i := 1; i < totalWaiters; i++ {
+			if errs[i] == nil {
+				t.Errorf("Waiter %d received nil error; expected panic error", i)
+			}
+			if len(results[i]) > 0 {
+				t.Errorf("Waiter %d received non-empty result %q; expected nil", i, string(results[i]))
+			}
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("Deadlock detected with multiple waiters waiting on panicked primary")
+	}
+
+	// Verify group is ready for new queries
+	res, _, err := g.Do(dstIP, qname, qtype, func() ([]byte, error) {
+		return []byte("all-good"), nil
+	})
+	if err != nil || string(res) != "all-good" {
+		t.Errorf("Group failed to recover after panic burst: res=%q, err=%v", string(res), err)
+	}
+}
+
 

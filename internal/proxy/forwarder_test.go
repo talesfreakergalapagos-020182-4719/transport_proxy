@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -311,4 +312,207 @@ func TestForwarder_DialOutbound_HTTPSProxy(t *testing.T) {
 		t.Errorf("Expected ping, got %s", string(buf))
 	}
 }
+
+func TestSanitizeProxyURL(t *testing.T) {
+	testCases := []struct {
+		input    string
+		expected string
+	}{
+		{
+			input:    "http://DOMAIN\\user:pass@proxy.corp:8080",
+			expected: "http://DOMAIN%5Cuser:pass@proxy.corp:8080",
+		},
+		{
+			input:    "http://CORP\\subdomain\\user:p@ssword@proxy:8080",
+			expected: "http://CORP%5Csubdomain%5Cuser:p@ssword@proxy:8080",
+		},
+		{
+			input:    "http://user:pass@proxy.corp:8080",
+			expected: "http://user:pass@proxy.corp:8080",
+		},
+		{
+			input:    "http://proxy.corp:8080",
+			expected: "http://proxy.corp:8080",
+		},
+		{
+			input:    "",
+			expected: "",
+		},
+	}
+
+	for _, tc := range testCases {
+		got := SanitizeProxyURL(tc.input)
+		if got != tc.expected {
+			t.Errorf("SanitizeProxyURL(%q) = %q; want %q", tc.input, got, tc.expected)
+		}
+	}
+}
+
+func TestForwarder_FreshConnectionBasicRetry(t *testing.T) {
+	// Simulate an upstream proxy that sends 407 and closes connection on unauthenticated request,
+	// but accepts authenticated CONNECT on fresh connection.
+	connectionCount := 0
+	expectedUser := "testuser"
+	expectedPass := "testpass"
+	expectedToken := base64.StdEncoding.EncodeToString([]byte(expectedUser + ":" + expectedPass))
+
+	proxyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		connectionCount++
+		auth := r.Header.Get("Proxy-Authorization")
+		if auth != "Basic "+expectedToken {
+			// Reject with 407 and close connection
+			w.Header().Set("Proxy-Authenticate", "Basic realm=\"Corp\"")
+			w.Header().Set("Connection", "close")
+			w.WriteHeader(http.StatusProxyAuthRequired)
+			return
+		}
+
+		// Accept authenticated CONNECT
+		hijacker, ok := w.(http.Hijacker)
+		if !ok {
+			http.Error(w, "hijack not supported", 500)
+			return
+		}
+		c, _, _ := hijacker.Hijack()
+		defer c.Close()
+		c.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+		buf := make([]byte, 4)
+		io.ReadFull(c, buf)
+		c.Write(buf)
+	}))
+	defer proxyServer.Close()
+
+	proxyURL := fmt.Sprintf("http://%s:%s@%s", expectedUser, expectedPass, strings.TrimPrefix(proxyServer.URL, "http://"))
+	fwd := NewForwarder(false, 5) // bypassSSPI = false
+
+	conn, _, err := fwd.DialOutbound("target.domain:443", proxyURL)
+	if err != nil {
+		t.Fatalf("DialOutbound failed: %v", err)
+	}
+	defer conn.Close()
+
+	// Verify echo over tunnel
+	if _, err := conn.Write([]byte("echo")); err != nil {
+		t.Fatalf("Write failed: %v", err)
+	}
+	buf := make([]byte, 4)
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		t.Fatalf("Read failed: %v", err)
+	}
+	if string(buf) != "echo" {
+		t.Errorf("Expected 'echo', got %q", string(buf))
+	}
+}
+
+type drainTrackingConn struct {
+	r            *io.PipeReader
+	w            *io.PipeWriter
+	closed       bool
+	closeWritten bool
+	readDeadline time.Time
+	mu           sync.Mutex
+}
+
+func (d *drainTrackingConn) Read(b []byte) (n int, err error) {
+	return d.r.Read(b)
+}
+
+func (d *drainTrackingConn) Write(b []byte) (n int, err error) {
+	return d.w.Write(b)
+}
+
+func (d *drainTrackingConn) Close() error {
+	d.mu.Lock()
+	d.closed = true
+	d.mu.Unlock()
+	_ = d.r.Close()
+	_ = d.w.Close()
+	return nil
+}
+
+func (d *drainTrackingConn) CloseWrite() error {
+	d.mu.Lock()
+	d.closeWritten = true
+	d.mu.Unlock()
+	return d.w.Close()
+}
+
+func (d *drainTrackingConn) SetReadDeadline(t time.Time) error {
+	d.mu.Lock()
+	d.readDeadline = t
+	d.mu.Unlock()
+	return nil
+}
+
+func (d *drainTrackingConn) SetDeadline(t time.Time) error      { return nil }
+func (d *drainTrackingConn) SetWriteDeadline(t time.Time) error { return nil }
+func (d *drainTrackingConn) LocalAddr() net.Addr                { return &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 1234} }
+func (d *drainTrackingConn) RemoteAddr() net.Addr               { return &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 5678} }
+
+func TestPipeConnEx_HalfCloseSafeDrain(t *testing.T) {
+	// Verify that when client sends EOF (half-close), upstream connection (c2) gets a 60s safe drain deadline
+	// Client <-> c1
+	c1R, clientW := io.Pipe()
+	clientR, c1W := io.Pipe()
+	c1 := &drainTrackingConn{r: c1R, w: c1W}
+
+	// c2 <-> Upstream Server
+	serverR, c2W := io.Pipe()
+	c2R, serverW := io.Pipe()
+	c2 := &drainTrackingConn{r: c2R, w: c2W}
+
+	done := make(chan struct{})
+	go func() {
+		// idleTimeout = 0 simulates permanent/interactive connection (e.g. SSH / long-polling)
+		PipeConnEx(c1, c2, nil, nil, 0)
+		close(done)
+	}()
+
+	// 1. Client writes request and closes its write end (half-close)
+	_, _ = clientW.Write([]byte("request-payload"))
+	_ = clientW.Close()
+
+	// Upstream server reads request
+	reqBuf := make([]byte, 15)
+	_, _ = io.ReadFull(serverR, reqBuf)
+	if string(reqBuf) != "request-payload" {
+		t.Errorf("Upstream expected 'request-payload', got %q", string(reqBuf))
+	}
+
+	// Wait briefly for PipeConnEx to process client EOF
+	time.Sleep(30 * time.Millisecond)
+
+	// Verify that c2 had SetReadDeadline applied with ~60s safe drain timeout
+	c2.mu.Lock()
+	deadline := c2.readDeadline
+	c2.mu.Unlock()
+
+	if deadline.IsZero() {
+		t.Errorf("Expected c2 to have a safe drain deadline set after client EOF, got zero time")
+	} else {
+		remaining := time.Until(deadline)
+		if remaining < 50*time.Second || remaining > 70*time.Second {
+			t.Errorf("Expected drain deadline ~60s in future, got %v", remaining)
+		}
+	}
+
+	// 2. Upstream responds with answer and closes
+	_, _ = serverW.Write([]byte("response-payload"))
+	_ = serverW.Close()
+
+	// Client reads response
+	respBuf := make([]byte, 16)
+	n, _ := clientR.Read(respBuf)
+	if string(respBuf[:n]) != "response-payload" {
+		t.Errorf("Client expected 'response-payload', got %q", string(respBuf[:n]))
+	}
+
+	select {
+	case <-done:
+		// Succeeded cleanly without deadlock
+	case <-time.After(1 * time.Second):
+		t.Fatalf("PipeConnEx deadlocked or hung after half-close completion")
+	}
+}
+
 

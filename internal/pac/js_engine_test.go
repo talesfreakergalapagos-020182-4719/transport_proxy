@@ -1,6 +1,7 @@
 package pac
 
 import (
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -198,6 +199,156 @@ func TestParsePACResult(t *testing.T) {
 		}
 		if !tt.expectedDirect && d.ProxyURL != tt.expectedProxy {
 			t.Errorf("ParsePACResult(%q): expected ProxyURL=%q, got %q", tt.input, tt.expectedProxy, d.ProxyURL)
+		}
+	}
+}
+
+func TestJSEngine_ShExpMatch_URLPaths(t *testing.T) {
+	pacScript := `
+function FindProxyForURL(url, host) {
+    if (shExpMatch(url, "http://*.example.com/api/*")) {
+        return "PROXY api-proxy:8080";
+    }
+    if (shExpMatch(url, "*://secure.example.com/*")) {
+        return "HTTPS secure-proxy:8443";
+    }
+    return "DIRECT";
+}
+`
+	engine, err := NewJSEngine(pacScript)
+	if err != nil {
+		t.Fatalf("Failed to initialize JSEngine: %v", err)
+	}
+	defer engine.Close()
+
+	tests := []struct {
+		url      string
+		host     string
+		expected string
+	}{
+		{"http://v1.example.com/api/v2/users", "v1.example.com", "http://api-proxy:8080"},
+		{"http://v1.example.com/other", "v1.example.com", ""}, // DIRECT
+		{"https://secure.example.com/login", "secure.example.com", "https://secure-proxy:8443"},
+	}
+
+	for _, tt := range tests {
+		res, err := engine.FindProxyForURL(tt.url, tt.host)
+		if err != nil {
+			t.Fatalf("FindProxyForURL failed for %s: %v", tt.url, err)
+		}
+		d := ParsePACResult(res)
+		if tt.expected == "" && !d.IsDirect {
+			t.Errorf("Expected DIRECT for %s, got %s", tt.url, d.ProxyURL)
+		} else if tt.expected != "" && d.ProxyURL != tt.expected {
+			t.Errorf("Expected %s for %s, got %s", tt.expected, tt.url, d.ProxyURL)
+		}
+	}
+}
+
+func TestJSEngine_TimeoutProtection_PoolSafety(t *testing.T) {
+	pacScript := `
+function FindProxyForURL(url, host) {
+    if (url.indexOf("hang=true") !== -1) {
+        while (true) {}
+    }
+    return "PROXY healthy-proxy:8080";
+}
+`
+	engine, err := NewJSEngine(pacScript)
+	if err != nil {
+		t.Fatalf("Failed to initialize JSEngine: %v", err)
+	}
+	defer engine.Close()
+
+	engine.timeout = 50 * time.Millisecond
+
+	// 1. Trigger timeout
+	_, err = engine.FindProxyForURL("http://example.com/test?hang=true", "example.com")
+	if err == nil {
+		t.Fatalf("Expected timeout error")
+	}
+
+	// 2. Subsequent call must succeed (pool was not poisoned with interrupted VM)
+	res, err := engine.FindProxyForURL("http://example.com/test?hang=false", "example.com")
+	if err != nil {
+		t.Fatalf("Subsequent call failed due to poisoned pool: %v", err)
+	}
+	d := ParsePACResult(res)
+	if d.ProxyURL != "http://healthy-proxy:8080" {
+		t.Errorf("Expected http://healthy-proxy:8080, got %s", d.ProxyURL)
+	}
+}
+
+func TestMatchShExp_Exhaustive(t *testing.T) {
+	testCases := []struct {
+		str      string
+		pattern  string
+		expected bool
+	}{
+		{"http://sub.domain.com/path/file.html", "http://*.domain.com/*/file.html", true},
+		{"http://sub.domain.com/path/file.html", "http://*.domain.com/other/*", false},
+		{"ftp://files.corp.internal/a/b/c", "*://*.corp.internal/*", true},
+		{"https://test.corp:8443/api?id=123", "https://*.corp:8443/api?id=*", true},
+		{"https://test.corp:8443/api?id=123", "https://*.corp:8443/api?key=*", false},
+		{"foo.bar", "foo.?ar", true},
+		{"foobar", "foo?ar", true},
+		{"foobar", "foo?az", false},
+		{"foor", "foo?ar", false},
+		{"anything", "*", true},
+		{"exact-match", "exact-match", true},
+		{"prefix-match-extra", "prefix-match", false},
+		{"", "*", true},
+		{"", "", true},
+		{"test", "", false},
+		{"", "test", false},
+	}
+
+	for _, tc := range testCases {
+		t.Run(fmt.Sprintf("%s_VS_%s", tc.str, tc.pattern), func(t *testing.T) {
+			got := MatchShExp(tc.str, tc.pattern)
+			if got != tc.expected {
+				t.Errorf("MatchShExp(%q, %q) = %v; want %v", tc.str, tc.pattern, got, tc.expected)
+			}
+		})
+	}
+}
+
+func TestJSEngine_MultipleTimeouts_NoLeakOrHang(t *testing.T) {
+	// Engine with a script that times out if url contains "loop"
+	pacScript := `
+function FindProxyForURL(url, host) {
+    if (url.indexOf("loop") !== -1) {
+        var x = 0;
+        while (true) { x++; }
+    }
+    return "PROXY normal-proxy:8080";
+}
+`
+	engine, err := NewJSEngine(pacScript)
+	if err != nil {
+		t.Fatalf("Failed to initialize JSEngine: %v", err)
+	}
+	defer engine.Close()
+
+	engine.timeout = 30 * time.Millisecond
+
+	// 1. Run 5 consecutive timeouts to ensure interrupted VMs are safely discarded
+	for i := 0; i < 5; i++ {
+		_, err := engine.FindProxyForURL(fmt.Sprintf("http://loop-%d.test", i), "loop.test")
+		if err == nil {
+			t.Fatalf("Expected timeout error at iteration %d", i)
+		}
+	}
+
+	// 2. Run 10 consecutive normal queries to ensure freshly created VMs work seamlessly
+	for i := 0; i < 10; i++ {
+		res, err := engine.FindProxyForURL("http://normal.test", "normal.test")
+		if err != nil {
+			t.Fatalf("Normal query failed at iteration %d: %v", i, err)
+		}
+		d := ParsePACResult(res)
+		if d.ProxyURL != "http://normal-proxy:8080" {
+			t.Errorf("Expected normal-proxy:8080, got %s", d.ProxyURL)
 		}
 	}
 }

@@ -56,7 +56,21 @@ func (g *CoalesceGroup) Do(dstIP net.IP, qname string, qtype uint16, fn func() (
 	g.m[key] = c
 	g.mu.Unlock()
 
+	panicked := true
 	defer func() {
+		if r := recover(); r != nil || panicked {
+			if c.err == nil {
+				c.err = fmt.Errorf("dns coalesce query panicked: %v", r)
+			}
+			g.mu.Lock()
+			delete(g.m, key)
+			g.mu.Unlock()
+			c.wg.Done()
+			if r != nil {
+				panic(r)
+			}
+			return
+		}
 		g.mu.Lock()
 		delete(g.m, key)
 		g.mu.Unlock()
@@ -64,6 +78,7 @@ func (g *CoalesceGroup) Do(dstIP net.IP, qname string, qtype uint16, fn func() (
 	}()
 
 	c.val, c.err = fn()
+	panicked = false
 
 	if c.err != nil {
 		return nil, false, c.err

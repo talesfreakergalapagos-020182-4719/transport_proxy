@@ -155,10 +155,14 @@ func (ctx *SSPIContext) NextStep(serverTokenBase64 string) (clientToken string, 
 			return "", false, fmt.Errorf("failed to decode base64 server token: %w", err)
 		}
 
+		var pv unsafe.Pointer
+		if len(rawServerToken) > 0 {
+			pv = unsafe.Pointer(&rawServerToken[0])
+		}
 		inSecBuffer = SecBuffer{
 			cbBuffer:   uint32(len(rawServerToken)),
 			BufferType: SECBUFFER_TOKEN,
-			pvBuffer:   unsafe.Pointer(&rawServerToken[0]),
+			pvBuffer:   pv,
 		}
 		inDesc = &SecBufferDesc{
 			ulVersion: SECBUFFER_VERSION,
@@ -325,10 +329,14 @@ func (ctx *ServerSSPIContext) AcceptStep(clientTokenBase64 string) (serverToken 
 		return "", false, fmt.Errorf("failed to decode client token base64: %w", err)
 	}
 
+	var pv unsafe.Pointer
+	if len(rawClientToken) > 0 {
+		pv = unsafe.Pointer(&rawClientToken[0])
+	}
 	inSecBuffer := SecBuffer{
 		cbBuffer:   uint32(len(rawClientToken)),
 		BufferType: SECBUFFER_TOKEN,
-		pvBuffer:   unsafe.Pointer(&rawClientToken[0]),
+		pvBuffer:   pv,
 	}
 	inDesc := SecBufferDesc{
 		ulVersion: SECBUFFER_VERSION,
